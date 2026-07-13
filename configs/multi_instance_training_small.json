@@ -1,0 +1,26 @@
+// Figure 1(d): multi-instance training with the same 2x16 decoder as the baseline.
+// Training and pruning 64 candidates makes outcomes consistent at the same cost.
+{
+    "base_config": "default.json",
+    "training": {
+        "num_iterations": {
+            "aux": 0
+        },
+        "instance_schedule": [64, 16, 4, 1]
+    },
+    "model": {
+        "seed": 0, // Change to compare outcomes across model initializations.
+        "decoder": {
+            "hidden_layers": [16, 16]
+        }
+    },
+    "data_generation": {
+        "seed": 0,
+        "batch_size_schedule": ["1k", "4k", "16k", "64k"],
+        "share_data_between_instances": true
+    },
+    "checkpoints": {
+        "period": -1,
+        "phases": ["Sampler"]
+    }
+}

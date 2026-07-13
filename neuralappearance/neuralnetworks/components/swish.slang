@@ -1,0 +1,60 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// clang-format off
+implementing neural_networks;
+
+namespace Activation
+{
+
+public struct Swish<T : IReal, int Width>
+{
+    public int model_id;
+
+    [BackwardDifferentiable, PreferRecompute]
+    T activate(T x) { return x / (T(1.0f) + exp(-x)); }
+}
+
+public extension<T : IReal, int Width> Swish<T, Width>
+    : IRecordableModel<T[Width], T[Width]>
+{
+    [BackwardDifferentiable]
+    public T[Width] model_forward(T x[Width])
+    {
+        T y[Width];
+        [ForceUnroll]
+        for (int i = 0; i < Width; ++i)
+            y[i] = activate(x[i]);
+        return y;
+    }
+}
+
+public extension<T : IReal, int Width> Swish<T, Width>
+    : IRecordableModel<vector<T, Width>, vector<T, Width>>
+{
+    [BackwardDifferentiable]
+    public vector<T, Width> model_forward(vector<T, Width> x)
+    {
+        vector<T, Width> y;
+        [ForceUnroll]
+        for (int i = 0; i < Width; ++i)
+            y[i] = activate(x[i]);
+        return y;
+    }
+};
+
+public extension<T : IReal, int Width> Swish<T, Width>
+    : ICoopRecordableModel<T, Width, Width>
+{
+    [BackwardDifferentiable]
+    public CoopVec<T, Width> model_forward(CoopVec<T, Width> x)
+    {
+        let one = no_diff CoopVec<T, Width>(T(1.0f));
+        let denom = one + exp(-x);
+        let y = x / denom;
+
+        return y;
+    }
+}
+
+}

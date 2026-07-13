@@ -1,0 +1,264 @@
+{
+    // Reference materials provide the ground-truth BSDFs and spatial material
+    // parameters used to generate training samples.
+    // Supported types are MaterialX ("mtlx") and MDL ("mdl").
+    // Paths are resolved against `--assets-paths` (default: repository root).
+    // Declaring multiple reference materials at once will train them jointly
+    // as part of a single neural material.
+    "reference_materials": [
+        {
+            "type": "mtlx",
+            "path": "assets/materials/FauxLeather.mtlx"
+        },
+        // {
+        //     "type": "mtlx",
+        //     "path": "assets/materials/Bark.mtlx"
+        // },
+        // {
+        //     "type": "mtlx",
+        //     "path": "assets/materials/PatternedMetal.mtlx"
+        // },
+        // {
+        //     "type": "mdl",
+        //     "path": "vMaterials_2/Wood/Wood_Tiles_Pine.mdl",
+        //     "material": "Wood_Tiles_Pine_Mosaic"
+        // }
+    ],
+
+    "training": {
+        // Iteration counts for the sequential training phases. A count of zero
+        // skips the optional sampler, auxiliary, or fine-tuning phase.
+        "num_iterations": {
+            // Jointly train the encoder and BSDF decoder, then bake the encoder
+            // output into the latent textures.
+            "bsdf": 100000,
+            // Directly optimize the latent texels and decoder.
+            "bsdf_finetuning": 0,
+            // Train the importance sampler against the frozen neural BSDF.
+            "sampler": 50000,
+            // Train the auxiliary decoder against configured target signals.
+            "aux": 50000
+        },
+
+        // Accumulate parameter gradients in a fixed order for reproducible
+        // training runs. This uses substantially more GPU memory, especially
+        // with direct latent optimization.
+        "deterministic": true,
+
+        "optimizer": {
+            // Base Adam learning rate. Each phase anneals it independently.
+            "learning_rate": 0.001,
+            // Final learning-rate multiplier for cosine annealing. For example,
+            // 0.01 ends a phase at 1% of the base learning rate.
+            "cosine_annealing_scale": 0.01,
+            // Loss/gradient scaling used to protect FP16 gradients from
+            // underflow; the optimizer removes it again before the update step.
+            "gradient_scale": 128.0,
+
+            "hyperparams": {
+                // Standard Adam optimizer configs.
+                "beta1": 0.9,
+                "beta2": 0.999,
+                "epsilon": 1e-07,
+                // Regularization applied to parameters during the update step.
+                "l2_regularization": 0.0,
+                // Skip individual non-finite gradient updates instead of
+                // allowing them to corrupt optimizer state.
+                "ignore_invalid_gradients": true
+            }
+        },
+
+        // Train several randomly initialized model instances in parallel and
+        // prune to the lowest-loss survivors. The list divides each training
+        // phase into equal periods; matching it to "batch_size_schedule"
+        // increases the batch size as instances are removed.
+        "instance_schedule": [64, 16, 4, 1],
+
+        "loss_function": {
+            // BSDF loss. Supported types are L1, L2, L1WithPowerLog,
+            // L1WithPowerRoot, L1WithSafeLog, RelativeL1, RelativeL2, and
+            // SMAPE.
+            // Aux decoder training always uses RelativeL2.
+            "type": "L1WithPowerLog",
+            // Exponent used only by L1WithPowerLog and L1WithPowerRoot.
+            "power": 3.0,
+            // Denominator stabilizer for relative losses and SMAPE.
+            "epsilon": 1e-4
+        }
+    },
+
+    "model": {
+        // Seeds model parameter initialization.
+        "seed": 0,
+
+        // Spatial latent textures store the compressed material representation
+        // consumed by all decoders.
+        "latents": {
+            // Number of texture MIP levels to learn.
+            "num_mip_levels": 1,
+            // Latent values stored per texel. More channels increase capacity,
+            // texture memory, and decoder inputs.
+            "num_channels": 8,
+            // Smoothly bound latents to (-1, 1) range.
+            "normalize": true
+        },
+
+        // The encoder maps native material parameters to latent codes during
+        // BSDF training. Removing this section (or setting it to null) selects
+        // direct latent optimization instead.
+        "encoder": {
+            // Entries are hidden-layer widths; one activation follows each.
+            "hidden_layers": [64, 64, 64],
+            "hidden_activations": "LeakyReLU"
+        },
+
+        // Represents the material's main BSDF by mapping latents and a
+        // direction pair to BSDF values.
+        "decoder": {
+            "hidden_layers": [16, 16],
+            "hidden_activations": "SmeLU",
+            // Constrain BSDF predictions to non-negative values. "Exp" is also
+            // supported; ScaledSigmoid approaches the configured upper bound.
+            "output_activation": {
+                "type": "ScaledSigmoid",
+                "scale": 1e5
+            },
+            // Convert incident/outgoing directions to half/difference vectors.
+            // Supported values are "Rusinkiewicz" and the numerically more
+            // robust "StableRusinkiewicz".
+            "half_diff_parameterization": "StableRusinkiewicz",
+            // Number of latent-dependent local shading frames. Zero keeps only
+            // the original frame; additional frames improve model accuracy
+            // at the cost of more direction inputs.
+            "num_shading_frames": 2,
+            // Direction features passed to the decoder: original wi/wo,
+            // half/difference wh/wd, wh/wd plus the original z components, or
+            // both complete representations.
+            // Valid values: "WiWo", "WhWd", "WhWdZiZo", "WhWdWiWo".
+            "direction_inputs": "WhWdZiZo"
+        },
+
+        // Provides importance sampling of the learned BSDF for integration into
+        // path tracers using one diffuse and a configurable number of specular
+        // GGX lobes.
+        "sampler": {
+            "num_specular_lobes": 1,
+            "hidden_layers": [16, 16],
+            "hidden_activations": "LeakyReLU"
+        },
+
+        // Predicts auxiliary material properties from the frozen latents and
+        // incident direction for rendering-system needs such as denoiser guide
+        // buffers. Other supported reference targets are "mc_albedo" and
+        // "ref_diffuse_specular_roughness".
+        "aux": {
+            "targets": "ref_diffuse_specular_roughness_normal",
+            "hidden_layers": [16, 16],
+            "hidden_activations": "SmeLU"
+        }
+    },
+
+    "data_generation": {
+        // Seeds training data generation.
+        "seed": 0,
+        // Batch sizes to use during equal-length training phase periods. Values
+        // must be perfect squares because UV samples are stratified on a square
+        // grid.
+        "batch_size_schedule": ["1k", "4k", "16k", "64k"],
+        // Generate this many optimizer batches together to amortize generation
+        // and submission overhead. Larger values increase temporary memory and
+        // the work queued between host-side schedule/checkpoint updates.
+        "num_batches_per_generation": 64,
+        // Give every model instance the same training samples. This correlates
+        // candidate losses and avoids generating per-instance data.
+        "share_data_between_instances": true,
+
+        // Direction-domain distribution used for BSDF training samples.
+        // "ImportanceWo" variants draw wo from the reference material.
+        // Available strategies: "UniformRusinkiewicz", "UniformWiUniformWo",
+        // "CosineWiCosineWo", "UniformWiImportanceWo", "CosineWiImportanceWo",
+        // "Balanced_UniformWiUniformWo_UniformWiImportanceWo", and
+        // "Balanced_UniformRusinkiewicz_UniformWiImportanceWo".
+        "directional_sampling_strategy": "Balanced_UniformRusinkiewicz_UniformWiImportanceWo",
+        // For a Balanced strategy, probability of using its first/base
+        // distribution; the remainder uses UniformWiImportanceWo.
+        "balanced_directional_sampling_ratio": 0.95,
+
+        // During encoder training, randomly permute or duplicate RGB channels
+        // in both material parameters and BSDF targets to emphasize faithful
+        // color reproduction. The application probability follows a cosine
+        // ramp from start_ratio to end_ratio over num_iterations.
+        "color_augmentation": {
+            "enabled": true,
+            "num_iterations": 100000,
+            "start_ratio": 1.0,
+            "end_ratio": 0.0
+        },
+
+        // Monte Carlo sample counts for spatial prefiltering when more than one
+        // latent MIP level is configured. Reference evaluation uses more
+        // samples for cleaner diagnostics.
+        "lod": {
+            "num_prefilter_samples": 64,
+            "num_prefilter_samples_reference": 256
+        }
+    },
+
+    "checkpoints": {
+        // Optimizer iterations between checkpoints within each eligible phase.
+        // Values <= 0 save only at the end of each phase.
+        "period": -1,
+        // Phases allowed to emit checkpoints; this does not enable or disable
+        // the training phases themselves.
+        "phases": ["BsdfEncoding", "BsdfDirectOptimization", "Sampler", "Aux"],
+
+        // Reference and checkpoint rendering settings.
+        "rendering": {
+            // Monte Carlo samples per pixel.
+            "spp": 16,
+            // Maximum path tracing depth.
+            "max_depth": 10,
+            // Reference BSDF renderings are written once before training (and
+            // aux references before aux training); neural renderings happen for
+            // each checkpoint.
+            "save_reference": true,
+            "save_neural": true,
+            // Render every material UDIM instead of only its first tile.
+            "all_udims": false,
+            // "exr" retains linear HDR values; "png" converts to 8-bit sRGB.
+            "format": "exr"
+        },
+
+        // Polar plots compare reference and neural angular responses at a grid
+        // of UV positions for every material and latent MIP level.
+        "bsdf_plots": {
+            "save": true,
+            // Number of UV positions along each axis, producing num_uvs^2 plots.
+            "num_uvs": 5,
+            // Angular samples drawn for each UV plot.
+            "num_samples": 1000,
+            // Generate "log", "linear", or both radial-axis variants.
+            "axes": ["log"],
+            // Pixel size of each individual subplot, excluding the legend.
+            "resolution": 450,
+            // Explicit UDIM number, or -1 to use each material's first tile.
+            "udim_id": -1
+        },
+
+        // A reloadable checkpoint normally needs both texture-backed state
+        // (images) and network weights/architecture metadata (params).
+        "model": {
+            "save_images": true,
+            "save_params": true
+        },
+
+        // Update aggregate training-loss figures after each optimization phase.
+        "loss_plots": {
+            "save": true
+        },
+
+        // After training, evaluate several losses on very large independently
+        // generated uniform and importance-sampled validation sets.
+        "validation_losses": false
+    }
+}

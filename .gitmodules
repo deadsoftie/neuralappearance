@@ -1,0 +1,3 @@
+[submodule "external/falcor2"]
+	path = external/falcor2
+	url = https://github.com/NVlabs/falcor2

@@ -1,0 +1,46 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["external"]
+
+[tool.ruff.lint]
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "B",
+    "I",
+    "UP",
+    "C4",
+    "PIE",
+    "RUF",
+]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.pyright]
+include = [
+    "neuralappearance",
+    "configure.py",
+]
+exclude = [
+    "**/.*",
+    "**/__pycache__",
+    "**/node_modules",
+    ".venv",
+    "external/falcor2",
+]
+ignore = [
+    "external/falcor2",
+]
+extraPaths = [
+    "neuralappearance",
+    "external/falcor2",
+    "external/falcor2/external/slangpy"
+]
+typeCheckingMode = "basic"
+reportAttributeAccessIssue = false
+reportArgumentType = "warning"
+reportOptionalMemberAccess = "warning"
