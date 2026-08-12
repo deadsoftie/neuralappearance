@@ -1,0 +1,6 @@
+outs:
+- md5: 03aac3d5961d160790c2e707c0d57ed4.dir
+  size: 2117558
+  nfiles: 1
+  hash: md5
+  path: geometry

@@ -1,0 +1,6 @@
+outs:
+- md5: eccc0dd245de36ab343f4eb8acd5a246.dir
+  size: 1352580
+  nfiles: 1
+  hash: md5
+  path: envmaps

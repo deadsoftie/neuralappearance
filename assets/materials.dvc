@@ -1,0 +1,6 @@
+outs:
+- md5: c818febc3624d9b516c85bae97113285.dir
+  size: 78680180
+  nfiles: 13
+  hash: md5
+  path: materials
