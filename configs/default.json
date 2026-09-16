@@ -6,10 +6,10 @@
     // Declaring multiple reference materials at once will train them jointly
     // as part of a single neural material.
     "reference_materials": [
-        {
-            "type": "mtlx",
-            "path": "assets/materials/FauxLeather.mtlx"
-        },
+        // {
+        //     "type": "mtlx",
+        //     "path": "assets/materials/FauxLeather.mtlx"
+        // },
         // {
         //     "type": "mtlx",
         //     "path": "assets/materials/Bark.mtlx"
@@ -18,11 +18,11 @@
         //     "type": "mtlx",
         //     "path": "assets/materials/PatternedMetal.mtlx"
         // },
-        // {
-        //     "type": "mdl",
-        //     "path": "vMaterials_2/Wood/Wood_Tiles_Pine.mdl",
-        //     "material": "Wood_Tiles_Pine_Mosaic"
-        // }
+        {
+            "type": "mdl",
+            "path": "vMaterials_2/Wood/Wood_Tiles_Pine.mdl",
+            "material": "Wood_Tiles_Pine_Mosaic"
+        }
     ],
 
     "training": {
