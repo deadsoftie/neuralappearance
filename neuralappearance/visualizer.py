@@ -406,8 +406,9 @@ class RenderAppWindow(AppWindow):
         self.orbit_controller.move_speed *= 0.1
         self.use_orbit = False
 
-        # Half-resolution buffers for side-by-side (1:1 aspect per panel).
-        half_w = self.window.width // 2
+        # Half-resolution buffers for the 2-way side-by-side (1:1 aspect per panel).
+        self.half_w = self.window.width // 2
+        half_w = self.half_w
         self.sbs_tensors = [
             spy.Tensor.empty(self.device, shape=(self.window.height, half_w), dtype=spy.float4),
             spy.Tensor.empty(self.device, shape=(self.window.height, half_w), dtype=spy.float4),
@@ -415,6 +416,18 @@ class RenderAppWindow(AppWindow):
         self.sbs_accumulators = [
             GpuAccumulator(self.device, half_w, self.window.height, self.vis.utils_module),
             GpuAccumulator(self.device, half_w, self.window.height, self.vis.utils_module),
+        ]
+
+        # Third-resolution buffers for the 3-way (reference/neural/compressed) side-by-side.
+        self.third_w = self.window.width // 3
+        third_w = self.third_w
+        self.sbs3_tensors = [
+            spy.Tensor.empty(self.device, shape=(self.window.height, third_w), dtype=spy.float4)
+            for _ in range(3)
+        ]
+        self.sbs3_accumulators = [
+            GpuAccumulator(self.device, third_w, self.window.height, self.vis.utils_module)
+            for _ in range(3)
         ]
 
         # Full-resolution tensors for single-view modes.
@@ -442,11 +455,14 @@ class RenderAppWindow(AppWindow):
         )
 
         # UI.
+        view_items = ['Neural only', 'Reference only', 'Side-by-side']
+        if self.vis.has_compressed:
+            view_items.append('Reference - Neural - Compressed')
         self.view_combobox = spy.ui.ComboBox(
             self.ui_window,
             'View',
             value=self.vis.view_mode,
-            items=['Neural only', 'Reference only', 'Side-by-side'],
+            items=view_items,
             callback=lambda idx: self.vis.set_view_mode(idx),
         )
         self.signal_combobox = spy.ui.ComboBox(
@@ -493,6 +509,30 @@ class RenderAppWindow(AppWindow):
             callback=lambda v: self.set_orbit(v),
         )
 
+        # Which-side-is-which labels for side-by-side view.
+        self.label_y = self.window.height - 50
+        self.reference_label = spy.ui.Window(
+            parent=self.ui.screen,
+            title='Reference',
+            position=spy.float2(10, self.label_y),
+            size=spy.float2(140, 40),
+        )
+        self.neural_label = spy.ui.Window(
+            parent=self.ui.screen,
+            title='Neural',
+            position=spy.float2(half_w + 10, self.label_y),
+            size=spy.float2(140, 40),
+        )
+        self.compressed_label = spy.ui.Window(
+            parent=self.ui.screen,
+            title='Compressed',
+            position=spy.float2(2 * third_w + 10, self.label_y),
+            size=spy.float2(140, 40),
+        )
+        self.reference_label.visible = False
+        self.neural_label.visible = False
+        self.compressed_label.visible = False
+
     def set_orbit(self, use_orbit: bool) -> None:
         self.use_orbit = use_orbit
         self.orbit_checkbox.value = use_orbit
@@ -520,27 +560,39 @@ class RenderAppWindow(AppWindow):
 
         if event.type == spy.MouseEventType.button_down:
             # Split pointer coordinates across the side-by-side view.
+            side_by_side = self.vis.view_mode in (2, 3)
             if self.vis.view_mode == 2:
-                half_w = self.window.width // 2
-                use_neural = event.pos.x >= half_w
-                pixel = spy.float2(event.pos.x - (half_w if use_neural else 0), event.pos.y)
-                self.camera.width = half_w
-                self.camera.recompute()
+                panel_w = self.half_w
+                panel_idx = 1 if event.pos.x >= panel_w else 0
+            elif self.vis.view_mode == 3:
+                panel_w = self.third_w
+                panel_idx = min(2, int(event.pos.x // panel_w))
             else:
-                use_neural = self.vis.show_neural
+                panel_w = None
+                panel_idx = None
+
+            if side_by_side:
+                pixel = spy.float2(event.pos.x - panel_idx * panel_w, event.pos.y)
+                self.camera.width = panel_w
+                self.camera.recompute()
+                scene = self.vis.scene_for_panel(panel_idx, self.vis.view_mode)
+            else:
                 pixel = event.pos
-            scene = self.vis.scene_for(use_neural)
+                scene = self.vis.scene_for(self.vis.show_neural)
 
             reference_id = self.vis.reference_materials[self.vis.material_idx].backend_id
             neural_id = int(self.vis.neural_material.material_id)
+            compressed_id = (
+                int(self.vis.compressed_material.material_id) if self.vis.has_compressed else None
+            )
 
             valid, material_id, uv, wi = self.trace_ray(pixel, scene)
 
-            if self.vis.view_mode == 2:
+            if side_by_side:
                 self.camera.width = self.window.width
                 self.camera.recompute()
 
-            if valid and (material_id == reference_id or material_id == neural_id):
+            if valid and material_id in (reference_id, neural_id, compressed_id):
                 self.vis.set_uv(uv)
                 sph = self.vis.module.cartesian_to_spherical_rad(wi)
                 self.vis.set_theta_i(sph.x)
@@ -549,8 +601,7 @@ class RenderAppWindow(AppWindow):
     def update(self, dt) -> None:
         super().update(dt)
 
-        side_by_side = self.vis.view_mode == 2
-        if side_by_side:
+        if self.vis.view_mode in (2, 3):
             self.ui_window.position = spy.float2(10, 10)
 
         if self.active_camera_controller.update(dt):
@@ -562,11 +613,13 @@ class RenderAppWindow(AppWindow):
         self.frame += 1
 
     def _update_render(self) -> None:
-        side_by_side = self.vis.view_mode == 2
-        half_w = self.window.width // 2
+        two_way = self.vis.view_mode == 2
+        three_way = self.vis.view_mode == 3
 
         if self.reset_accumulation:
             for acc in self.sbs_accumulators:
+                acc.reset()
+            for acc in self.sbs3_accumulators:
                 acc.reset()
             self.neural_accum.reset()
             self.ref_accum.reset()
@@ -576,35 +629,42 @@ class RenderAppWindow(AppWindow):
         material = self.vis.reference_materials[self.vis.material_idx]
         self.vis.hybrid_pt_neural.set_target_material(None, 0)
         self.vis.hybrid_pt_ref.set_target_material(None, material.texture_resolution)
+        if self.vis.has_compressed:
+            self.vis.hybrid_pt_compressed.set_target_material(None, 0)
 
-        if side_by_side:
+        if two_way or three_way:
+            if two_way:
+                panel_w = self.half_w
+                panels = [
+                    (self.vis.hybrid_pt_ref, self.sbs_tensors[0], self.sbs_accumulators[0], 0, 'reference'),
+                    (self.vis.hybrid_pt_neural, self.sbs_tensors[1], self.sbs_accumulators[1], panel_w, 'neural'),
+                ]
+            else:
+                panel_w = self.third_w
+                panels = [
+                    (self.vis.hybrid_pt_ref, self.sbs3_tensors[0], self.sbs3_accumulators[0], 0, 'reference'),
+                    (self.vis.hybrid_pt_neural, self.sbs3_tensors[1], self.sbs3_accumulators[1], panel_w, 'neural'),
+                    (self.vis.hybrid_pt_compressed, self.sbs3_tensors[2], self.sbs3_accumulators[2], 2 * panel_w, 'compressed'),
+                ]
+
             prev_w = self.camera.width
-            self.camera.width = half_w
+            self.camera.width = panel_w
             self.camera.recompute()
 
-            for hpt, tensor, accum, x_offset, neural in [
-                (self.vis.hybrid_pt_ref, self.sbs_tensors[0], self.sbs_accumulators[0], 0, False),
-                (
-                    self.vis.hybrid_pt_neural,
-                    self.sbs_tensors[1],
-                    self.sbs_accumulators[1],
-                    half_w,
-                    True,
-                ),
-            ]:
-                self._render_signal(hpt, tensor, neural)
+            for hpt, tensor, accum, x_offset, panel in panels:
+                self._render_signal(hpt, tensor, panel)
                 accum.update_and_output(tensor, tensor)
                 self.vis.resample_helper.resample(
                     tensor,
                     self.output_texture,
                     output_pos=spy.uint2(x_offset, 0),
-                    output_size=spy.uint2(half_w, self.output_texture.height),
+                    output_size=spy.uint2(panel_w, self.output_texture.height),
                 )
 
             self.camera.width = prev_w
             self.camera.recompute()
         elif self.vis.show_neural:
-            self._render_signal(self.vis.hybrid_pt_neural, self.neural_tensor, True)
+            self._render_signal(self.vis.hybrid_pt_neural, self.neural_tensor, 'neural')
             self.neural_accum.update_and_output(self.neural_tensor, self.neural_tensor)
             self.vis.resample_helper.resample(
                 self.neural_tensor,
@@ -613,7 +673,7 @@ class RenderAppWindow(AppWindow):
                 output_size=spy.uint2(self.window.width, self.window.height),
             )
         else:
-            self._render_signal(self.vis.hybrid_pt_ref, self.ref_tensor, False)
+            self._render_signal(self.vis.hybrid_pt_ref, self.ref_tensor, 'reference')
             self.ref_accum.update_and_output(self.ref_tensor, self.ref_tensor)
             self.vis.resample_helper.resample(
                 self.ref_tensor,
@@ -626,7 +686,7 @@ class RenderAppWindow(AppWindow):
         self,
         path_tracer: HybridPathTracer,
         output: spy.Tensor,
-        neural: bool,
+        panel: str,
     ) -> None:
         if self.vis.signal_idx == 0:
             path_tracer.render(
@@ -634,10 +694,10 @@ class RenderAppWindow(AppWindow):
                 output,
                 self.frame,
                 self.vis.mip_level,
-                neural,
+                panel != 'reference',
             )
         else:
-            self.vis.render_aux_signal(self.camera, output, self.frame, neural)
+            self.vis.render_aux_signal(self.camera, output, self.frame, panel)
 
     def trace_ray(self, pixel: spy.float2, scene) -> tuple[bool, int, spy.float2, spy.float3]:
         """Trace a ray through pixel for UV/direction picking."""
@@ -686,7 +746,7 @@ class NeuralMaterialVisualizer:
     plot_channel: int
     plot_colormap_idx: int
 
-    def __init__(self, checkpoint: str, assets_paths: str):
+    def __init__(self, checkpoint: str, assets_paths: str, compressed_checkpoint: str | None = None):
         super().__init__()
 
         self.device = spy.Device(
@@ -768,7 +828,41 @@ class NeuralMaterialVisualizer:
         self.neural_material = self.neural_scene.create_material(NeuralMaterial)
         self.neural_material.name = 'neural_material'
 
+        # Optional third instance: another full checkpoint (e.g. Project 3's
+        # NTC-swapped-latent condition C) previewed as a "Compressed" panel
+        # alongside reference/neural. Same loading pattern as the primary
+        # checkpoint above, just against a second checkpoint directory --
+        # config.json is a verbatim copy in that workflow, but this loads its
+        # own rather than assuming that.
+        self.has_compressed = compressed_checkpoint is not None
+        self.compressed_model: NeuralModelCheckpoint | None = None
+        self.compressed_scene = None
+        self.compressed_material = None
+        self.checkpoint_reference_materials_compressed = None
+        if self.has_compressed:
+            compressed_config_path, compressed_model_path = _resolve_checkpoint_paths(
+                compressed_checkpoint
+            )
+            compressed_checkpoint_config = load_config(compressed_config_path)
+            compressed_model_config = copy.deepcopy(compressed_checkpoint_config)
+            self.checkpoint_reference_materials_compressed = ReferenceMaterials.from_config(
+                compressed_model_config
+            )
+            compressed_model = NeuralModel(
+                training_module,
+                compressed_model_config,
+                self.checkpoint_reference_materials_compressed,
+            )
+            compressed_model.load_checkpoint(compressed_model_path)
+            self.compressed_model = compressed_model.get_checkpoint()
+
+            self.compressed_scene = create_testscene(self.device)
+            self.compressed_material = self.compressed_scene.create_material(NeuralMaterial)
+            self.compressed_material.name = 'compressed_material'
+
         self.scenes = [self.ref_scene, self.neural_scene]
+        if self.has_compressed:
+            self.scenes.append(self.compressed_scene)
 
         self.num_mip_levels = self.neural_model.num_mip_levels
 
@@ -784,6 +878,12 @@ class NeuralMaterialVisualizer:
         self.hybrid_pt_ref = HybridPathTracer(self.device)
         self.hybrid_pt_ref.max_depth = config_max_depth
         self.hybrid_pt_ref.scene = self.ref_scene
+
+        self.hybrid_pt_compressed = None
+        if self.has_compressed:
+            self.hybrid_pt_compressed = HybridPathTracer(self.device)
+            self.hybrid_pt_compressed.max_depth = config_max_depth
+            self.hybrid_pt_compressed.scene = self.compressed_scene
 
         self.module: Any = spy.Module.load_from_file(self.device, 'visualizer/visualizer.slang')
         self.module_neural: Any = spy.Module.load_from_file(
@@ -828,6 +928,12 @@ class NeuralMaterialVisualizer:
         """Return the scene for the given material type."""
         return self.neural_scene if use_neural else self.ref_scene
 
+    def scene_for_panel(self, panel_idx: int, view_mode: int):
+        """Return the scene for one panel of a side-by-side view (2- or 3-way)."""
+        if view_mode == 2:
+            return (self.ref_scene, self.neural_scene)[panel_idx]
+        return (self.ref_scene, self.neural_scene, self.compressed_scene)[panel_idx]
+
     def scene_module(self, scene: f2.Scene) -> spy.Module:
         """Return a VisualizerScene module linked against a native scene."""
         requirements_key = tuple(id(module) for module in scene.requirements.modules)
@@ -851,15 +957,25 @@ class NeuralMaterialVisualizer:
         camera: f2.Camera,
         output: spy.Tensor,
         iteration: int,
-        neural: bool,
+        panel: str,
     ) -> None:
         """Render the selected auxiliary signal at primary surface hits."""
         assert self.aux_targets is not None
-        assert self.neural_model.aux is not None
+
+        is_neural = panel != 'reference'
+        is_compressed = panel == 'compressed'
+        model = self.compressed_model if is_compressed else self.neural_model
+        neural_material = self.compressed_material if is_compressed else self.neural_material
+        checkpoint_reference_materials = (
+            self.checkpoint_reference_materials_compressed
+            if is_compressed
+            else self.checkpoint_reference_materials
+        )
+        assert not is_neural or model.aux is not None
 
         material = self.reference_materials[self.material_idx]
-        scene = self.scene_for(neural)
-        material_id = int(self.neural_material.material_id) if neural else int(material.backend_id)
+        scene = self.compressed_scene if is_compressed else self.scene_for(is_neural)
+        material_id = int(neural_material.material_id) if is_neural else int(material.backend_id)
         hit_kernel = self._get_hit_kernel(scene, material_id)
 
         shape = (output.shape[0], output.shape[1])
@@ -890,16 +1006,16 @@ class NeuralMaterialVisualizer:
             self.num_mip_levels,
             tid=spy.grid(shape),
         )
-        if neural:
-            checkpoint_material = self.checkpoint_reference_materials[self.material_idx]
+        if is_neural:
+            checkpoint_material = checkpoint_reference_materials[self.material_idx]
             latents = self.module_model.eval_latent_texture_bilinear_stochastic(
-                self.neural_model.latent_texture,
+                model.latent_texture,
                 checkpoint_material.id,
                 mip_level,
                 uv,
                 texel_sample,
             )
-            values = self.module_model.eval_aux(self.neural_model.aux, latents, wi)
+            values = self.module_model.eval_aux(model.aux, latents, wi)
         else:
             assert self.aux_data_generator is not None
             values = self.aux_data_generator.eval_reference(
@@ -946,7 +1062,7 @@ class NeuralMaterialVisualizer:
         return kernel.write(scene.bind)
 
     def update_material(self) -> None:
-        """Assign correct materials to preview geometry in both scenes."""
+        """Assign correct materials to preview geometry in all scenes."""
         self.render_window.reset_accumulation = True
 
         ref_mat = self.reference_materials[self.material_idx]
@@ -959,6 +1075,18 @@ class NeuralMaterialVisualizer:
             checkpoint_mat.id,
         )
         prepare_scene_material(self.neural_scene, self.neural_material)
+
+        if self.has_compressed:
+            checkpoint_mat_compressed = self.checkpoint_reference_materials_compressed[
+                self.material_idx
+            ]
+            self.compressed_material.configure(
+                self.device,
+                self.compressed_model,
+                checkpoint_mat_compressed.id,
+            )
+            prepare_scene_material(self.compressed_scene, self.compressed_material)
+
         self._scene_module_cache.clear()
         self._hit_kernel_cache.clear()
 
@@ -967,6 +1095,7 @@ class NeuralMaterialVisualizer:
         self.render_window.ui_window.visible = show_ui
         self.plot_window.ui_window.visible = show_ui
         self.uv_window.ui_window.visible = show_ui
+        self._update_side_by_side_labels()
 
     def set_show_neural(self, show_neural: bool) -> None:
         self.show_neural = show_neural
@@ -974,7 +1103,8 @@ class NeuralMaterialVisualizer:
         self.apply_view_mode()
 
     def set_view_mode(self, view_mode: int) -> None:
-        view_mode = max(0, min(2, view_mode))
+        max_mode = 3 if self.has_compressed else 2
+        view_mode = max(0, min(max_mode, view_mode))
         self.view_mode = view_mode
         self.show_neural = view_mode != 1
         self.apply_view_mode()
@@ -994,10 +1124,25 @@ class NeuralMaterialVisualizer:
         self.render_window.num_prefilter_samples_slider.enabled = not self.show_neural
         self.plot_window.window.title = f'BRDF plot: {plot_tag}'
         self.plot_window.redraw = True
+        self._update_side_by_side_labels()
+
+    def _update_side_by_side_labels(self) -> None:
+        rw = self.render_window
+        three_way = self.view_mode == 3
+        visible = self.show_ui and self.view_mode in (2, 3)
+
+        neural_x = rw.third_w if three_way else rw.half_w
+        rw.reference_label.position = spy.float2(10, rw.label_y)
+        rw.neural_label.position = spy.float2(neural_x + 10, rw.label_y)
+        rw.compressed_label.position = spy.float2(2 * rw.third_w + 10, rw.label_y)
+
+        rw.reference_label.visible = visible
+        rw.neural_label.visible = visible
+        rw.compressed_label.visible = self.show_ui and three_way
 
     @property
     def render_title(self) -> str:
-        view_titles = ('Neural', 'Reference', 'Reference | Neural')
+        view_titles = ('Neural', 'Reference', 'Reference | Neural', 'Reference | Neural | Compressed')
         return f'{view_titles[self.view_mode]} - {self.signal_names[self.signal_idx]}'
 
     def set_material_idx(self, material_idx: int) -> None:
@@ -1144,11 +1289,23 @@ if __name__ == '__main__':
         '-a',
         '--assets-paths',
         default=get_default_asset_paths(),
-        help='Semicolon-separated asset roots. Defaults to the repo root.',
+        help='Semicolon-separated asset roots. Defaults to the repo root. '
+        'For MDL materials, this must include the parent of the vMaterials_2 folder '
+        '(e.g. "C:\\Users\\rahul\\OneDrive\\Documents\\mdl"), not just the repo root.',
+    )
+    parser.add_argument(
+        '--compressed-checkpoint',
+        type=str,
+        default=None,
+        help='Optional path to a second checkpoint directory (e.g. one of Project 3\'s '
+        'NTC-swapped-latent checkpoints, 00200000_ntc_aggressive or '
+        '00200000_ntc_high_fidelity) to compare as a third "Compressed" panel in the '
+        'side-by-side view. Same config.json as --checkpoint/--jobs, so it needs the '
+        'same --assets-paths, not a separate one.',
     )
     args = parser.parse_args()
 
     checkpoint = args.checkpoint if args.checkpoint else find_latest_checkpoint(args.jobs)
 
-    app = NeuralMaterialVisualizer(checkpoint, args.assets_paths)
+    app = NeuralMaterialVisualizer(checkpoint, args.assets_paths, args.compressed_checkpoint)
     app.main_loop()

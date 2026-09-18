@@ -205,11 +205,16 @@ class HeadlessRenderer:
 
         label = f'mat{material_idx}-id{ref_mat.id}-{ref_mat.type}'
 
+        # Flushing periodically (rather than only once at the end) keeps the queued command count bounded
+        flush_interval = 128
+
         if views in ('both', 'neural'):
             self.neural_accum.reset()
             for frame in range(spp):
                 self.hybrid_pt_neural.render(self.camera, self.neural_tensor, frame, mip_level, True)
                 self.neural_accum.update_and_output(self.neural_tensor, self.neural_tensor)
+                if (frame + 1) % flush_interval == 0:
+                    self.device.wait()
             self.device.wait()
             save_image(self.neural_tensor, out_dir / f'{label}_neural_{spp}spp.png')
 
@@ -218,6 +223,8 @@ class HeadlessRenderer:
             for frame in range(spp):
                 self.hybrid_pt_ref.render(self.camera, self.ref_tensor, frame, mip_level, False)
                 self.ref_accum.update_and_output(self.ref_tensor, self.ref_tensor)
+                if (frame + 1) % flush_interval == 0:
+                    self.device.wait()
             self.device.wait()
             save_image(self.ref_tensor, out_dir / f'{label}_reference_{spp}spp.png')
 
