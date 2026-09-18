@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+import csv
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,69 @@ def _resolve_checkpoint_paths(checkpoint: str) -> tuple[Path, Path]:
     if not config_path.is_file():
         raise FileNotFoundError(f'Checkpoint config not found: {config_path}')
     return config_path, model_path
+
+
+def _format_mb(num_bytes: int) -> str:
+    return f'{num_bytes / 1e6:.1f} MB'
+
+
+def _latent_file_size_bytes(checkpoint_dir: Path, material_id: int, num_mip_levels: int) -> int | None:
+    """Sum the on-disk size of a material's latent EXR(s) across mip levels.
+
+    Matches the naming convention LatentTexture/Texture actually write
+    (``latents.material{id}.mip{level}.exr``, no UDIM suffix for the
+    single-UDIM case every checkpoint in this repo currently uses). Returns
+    None if no matching file is found, rather than raising, since this feeds
+    a UI label that should just go blank on an unexpected checkpoint layout.
+    """
+    total = 0
+    found_any = False
+    for mip_level in range(max(1, num_mip_levels)):
+        path = checkpoint_dir / f'latents.material{material_id}.mip{mip_level}.exr'
+        if path.is_file():
+            total += path.stat().st_size
+            found_any = True
+    return total if found_any else None
+
+
+def _lookup_project3_ntc_size_bytes(checkpoint_dir: Path) -> int | None:
+    """Resolve the true compressed (.ntc) size for a Project 3-style compressed
+    checkpoint, from Project 3's own results CSV.
+
+    The checkpoint directory itself never holds this number: condition C's
+    write_condition_c_checkpoint() writes back a fully decompressed EXR, the
+    same size as the uncompressed latent, so the real compressed size only
+    exists in docs/project3-rtnam-ntc/results/latent_ntc_roundtrip.csv. Only
+    resolves for the exact naming convention that harness produces
+    (.../project3_<material>/checkpoints/00200000_ntc_<bpp_label>); any other
+    --compressed-checkpoint path returns None.
+    """
+    prefix = '00200000_ntc_'
+    if not checkpoint_dir.name.startswith(prefix):
+        return None
+    bpp_label = checkpoint_dir.name[len(prefix):]
+
+    job_dir_prefix = 'project3_'
+    job_dir_name = checkpoint_dir.parent.parent.name
+    if not job_dir_name.startswith(job_dir_prefix):
+        return None
+    material = job_dir_name[len(job_dir_prefix):]
+
+    csv_path = (
+        Path(__file__).resolve().parent.parent.parent
+        / 'docs' / 'project3-rtnam-ntc' / 'results' / 'latent_ntc_roundtrip.csv'
+    )
+    if not csv_path.is_file():
+        return None
+
+    with open(csv_path, newline='') as f:
+        for row in csv.DictReader(f):
+            if row.get('material') == material and row.get('bpp_label') == bpp_label:
+                try:
+                    return int(float(row['file_size_bytes']))
+                except (KeyError, ValueError):
+                    return None
+    return None
 
 
 def _get_scene_camera(scene: f2.Scene) -> f2.Camera:
@@ -509,26 +573,31 @@ class RenderAppWindow(AppWindow):
             callback=lambda v: self.set_orbit(v),
         )
 
-        # Which-side-is-which labels for side-by-side view.
-        self.label_y = self.window.height - 50
+        # Which-side-is-which labels for side-by-side view, with each panel's
+        # latent storage size on a second line (blank where not applicable,
+        # e.g. Reference has no latent texture at all).
+        self.label_y = self.window.height - 70
         self.reference_label = spy.ui.Window(
             parent=self.ui.screen,
             title='Reference',
             position=spy.float2(10, self.label_y),
-            size=spy.float2(140, 40),
+            size=spy.float2(170, 60),
         )
         self.neural_label = spy.ui.Window(
             parent=self.ui.screen,
             title='Neural',
             position=spy.float2(half_w + 10, self.label_y),
-            size=spy.float2(140, 40),
+            size=spy.float2(170, 60),
         )
         self.compressed_label = spy.ui.Window(
             parent=self.ui.screen,
             title='Compressed',
             position=spy.float2(2 * third_w + 10, self.label_y),
-            size=spy.float2(140, 40),
+            size=spy.float2(170, 60),
         )
+        self.reference_storage_text = spy.ui.Text(self.reference_label, '')
+        self.neural_storage_text = spy.ui.Text(self.neural_label, '')
+        self.compressed_storage_text = spy.ui.Text(self.compressed_label, '')
         self.reference_label.visible = False
         self.neural_label.visible = False
         self.compressed_label.visible = False
@@ -781,6 +850,7 @@ class NeuralMaterialVisualizer:
         # checkpoint. The reference scene below may allocate different native
         # material IDs, so keep these IDs separate for latent lookup.
         config_path, model_path = _resolve_checkpoint_paths(checkpoint)
+        self.checkpoint_dir = model_path.parent
         checkpoint_config = load_config(config_path)
         model_config = copy.deepcopy(checkpoint_config)
         self.config = model_config
@@ -838,11 +908,13 @@ class NeuralMaterialVisualizer:
         self.compressed_model: NeuralModelCheckpoint | None = None
         self.compressed_scene = None
         self.compressed_material = None
+        self.compressed_checkpoint_dir = None
         self.checkpoint_reference_materials_compressed = None
         if self.has_compressed:
             compressed_config_path, compressed_model_path = _resolve_checkpoint_paths(
                 compressed_checkpoint
             )
+            self.compressed_checkpoint_dir = compressed_model_path.parent
             compressed_checkpoint_config = load_config(compressed_config_path)
             compressed_model_config = copy.deepcopy(compressed_checkpoint_config)
             self.checkpoint_reference_materials_compressed = ReferenceMaterials.from_config(
@@ -1089,6 +1161,40 @@ class NeuralMaterialVisualizer:
 
         self._scene_module_cache.clear()
         self._hit_kernel_cache.clear()
+        self._update_storage_labels()
+
+    def _update_storage_labels(self) -> None:
+        """Refresh each side-by-side label's latent storage size for the
+        currently selected material. Reference has no latent texture at all,
+        so its line stays blank; Neural and Compressed show the on-disk size
+        of the latent EXR actually loaded for that panel. For a Project
+        3-style compressed checkpoint, a second line adds the true compressed
+        (.ntc) size looked up from that project's own results CSV -- the
+        checkpoint directory itself only ever holds the decompressed EXR, see
+        _lookup_project3_ntc_size_bytes()."""
+        rw = self.render_window
+        checkpoint_mat = self.checkpoint_reference_materials[self.material_idx]
+
+        neural_bytes = _latent_file_size_bytes(
+            self.checkpoint_dir, checkpoint_mat.id, self.num_mip_levels
+        )
+        rw.neural_storage_text.text = _format_mb(neural_bytes) if neural_bytes is not None else ''
+        rw.reference_storage_text.text = ''
+
+        if self.has_compressed:
+            checkpoint_mat_compressed = self.checkpoint_reference_materials_compressed[
+                self.material_idx
+            ]
+            compressed_bytes = _latent_file_size_bytes(
+                self.compressed_checkpoint_dir, checkpoint_mat_compressed.id, self.num_mip_levels
+            )
+            lines = [_format_mb(compressed_bytes)] if compressed_bytes is not None else []
+            ntc_bytes = _lookup_project3_ntc_size_bytes(self.compressed_checkpoint_dir)
+            if ntc_bytes is not None:
+                lines.append(f'.ntc: {_format_mb(ntc_bytes)}')
+            rw.compressed_storage_text.text = '\n'.join(lines)
+        else:
+            rw.compressed_storage_text.text = ''
 
     def set_show_ui(self, show_ui: bool) -> None:
         self.show_ui = show_ui
