@@ -1098,8 +1098,29 @@ def training_bsdf_decoder_repair(job: TrainingJob) -> None:
     derivative that would write into ``buffer_grads`` is never invoked) and
     NeuralModel.active_training_models() (only returns components whose
     status is ``'Training'``, so the optimizer's ``initialize()`` never even
-    sees the latent's buffer). Verified with a live round-trip test before
-    this function was written; see PLAN.md's Phase A0 writeup.
+    sees the latent's buffer).
+
+    That second guarantee depends on the latent's status actually being
+    something other than ``'Training'`` by the time this function runs, and
+    that isn't automatic. ``NeuralModel.__init__`` sets the latent
+    component's status to ``'Training'`` unconditionally at construction
+    (model/neural_material_model.py, ``self.latent_texture =
+    InstancedComponent(..., status='Training')``), before anyone calls
+    ``start_training()``. What actually flips it to ``'Done'`` -- and is
+    the real reason ``active_training_models()`` excludes the latent here
+    -- is ``NeuralModel.load_checkpoint()``, which sets
+    ``component.status = 'Done'`` for every component it loads, latent
+    included. Callers of this function MUST call ``load_checkpoint()``
+    (directly or indirectly) before invoking it, on a freshly-constructed
+    ``NeuralModel``, with no intervening ``start_training()`` call on the
+    latent texture; skipping that load or reordering it after this call
+    would leave the latent's status at ``'Training'`` and reopen the
+    optimizer-visibility hole this docstring otherwise rules out. Every
+    current caller (stage_a1_decoder_repair.py, stage_a2_alternating_repair.py)
+    already follows this order.
+
+    Verified with a live round-trip test before this function was written;
+    see PLAN.md's Phase A0 writeup.
     """
 
     neural_model = job.neural_model
