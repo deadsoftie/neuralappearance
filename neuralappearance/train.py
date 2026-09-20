@@ -1074,6 +1074,118 @@ def training_bsdf_diropt(job: TrainingJob) -> None:
     neural_model.latent_texture.status = 'Done'
 
 
+def training_bsdf_decoder_repair(job: TrainingJob) -> None:
+    """Retrain only the BSDF decoder against a frozen, externally-supplied
+    latent texture (e.g. one round-tripped through a real NTC compress/
+    decompress pass). Project 4 Stage A, Phase A1
+    (docs/project4-fused-ntc/PLAN.md): does re-fitting the decoder recover
+    quality lost by swapping in a compressed latent, without touching the
+    latent itself at all -- the cheapest of Stage A's two sub-variants.
+
+    Caller is responsible for loading both the decoder's starting weights
+    and the frozen latent's values into ``job.neural_model`` before calling
+    this (typically via ``NeuralModel.load_checkpoint()`` followed by
+    ``LatentTexture.from_numpy()`` to overwrite the latent with the
+    round-tripped values) -- this function only drives the optimization
+    loop, it doesn't know where the latent came from.
+
+    Structurally identical to training_bsdf_diropt's finetuning branch,
+    minus latent optimization: ``neural_model.start_training()`` is never
+    called on the latent texture, so it stays exactly as loaded. This is
+    safe by construction, not just by omission -- confirmed by reading
+    model/texture.slang (``get_bilinear``/``get_nearest`` call ``detach()``
+    on their result whenever ``optimizable`` is false, so the backward
+    derivative that would write into ``buffer_grads`` is never invoked) and
+    NeuralModel.active_training_models() (only returns components whose
+    status is ``'Training'``, so the optimizer's ``initialize()`` never even
+    sees the latent's buffer). Verified with a live round-trip test before
+    this function was written; see PLAN.md's Phase A0 writeup.
+    """
+
+    neural_model = job.neural_model
+    module = job.module
+    config = job.config
+    phase_state = job.begin_phase('BsdfDirectOptimization', detail='decoder_repair')
+
+    print()
+
+    num_iterations = config['training']['num_iterations'].get('decoder_repair', 0)
+    if num_iterations == 0:
+        print('No decoder_repair iterations configured, skipping "training_bsdf_decoder_repair()".')
+        return
+
+    num_warmup_iterations = min(1000, num_iterations // 4)
+    lr_scheduler = LRSchedulerChain(
+        [
+            CosineAnnealingLRScheduler(
+                start_scale=0.0,
+                end_scale=1.0,
+                num_iterations=num_warmup_iterations,
+            ),
+            CosineAnnealingLRScheduler(
+                start_scale=1.0,
+                end_scale=config['training']['optimizer']['cosine_annealing_scale'],
+                num_iterations=num_iterations - num_warmup_iterations,
+            ),
+        ]
+    )
+
+    configured_batch_instance_scheduler = BatchInstanceScheduler(
+        config['training']['instance_schedule'],
+        config['data_generation']['batch_size_schedule'],
+    )
+    batch_instance_scheduler = BatchInstanceScheduler(
+        [neural_model.num_instances],
+        [configured_batch_instance_scheduler.batch_sizes[-1]],
+    )
+
+    neural_model.start_training(neural_model.decoder)
+
+    assert neural_model.num_instances == 1, (
+        'Decoder repair expects a single pruned decoder instance, same as '
+        'any post-encoding finetuning phase.'
+    )
+
+    job.data_generators.bsdf = FalcorBsdfDataGenerator(
+        job.device,
+        config,
+        job.reference_materials,
+        'BsdfDirectOptimization',
+    )
+
+    loss_function = LossFunction(
+        config['training']['loss_function'],
+        TrainingTargets('bsdf'),
+    )
+
+    train_bsdf_diropt = module.train_bsdf_diropt.as_func().map(
+        latent_texture=(0,), decoder=(0,), sample=(0, 1), sg=(0, 1)
+    )
+
+    def run_train_kernel(phase_runtime, sample, iteration_block):
+        train_bsdf_diropt(
+            latent_texture=neural_model.latent_texture_buffer,
+            decoder=neural_model.decoder_buffer,
+            sample=sample,
+            sg=phase_runtime.sample_generator,
+            loss_scale=phase_runtime.loss_scale,
+            call_id=spy.call_id(),
+            loss_buffer=phase_runtime.loss_buffer.tensor,
+            loss_function=loss_function,
+            _append_to=iteration_block.train_cmd,
+        )
+
+    job.run_phase_optimization(
+        phase_state=phase_state,
+        lr_scheduler=lr_scheduler,
+        batch_instance_scheduler=batch_instance_scheduler,
+        data_generator=job.data_generators.bsdf,
+        run_train_kernel=run_train_kernel,
+    )
+
+    neural_model.decoder.status = 'Done'
+
+
 def training_sampler(job: TrainingJob) -> None:
     """Train the importance sampler against the frozen neural BSDF."""
 

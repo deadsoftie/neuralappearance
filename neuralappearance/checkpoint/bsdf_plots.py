@@ -106,7 +106,13 @@ def save_bsdf_plots(
                 prediction_aux = ckpt.module.eval_aux(aux, latents, wis).to_numpy()
 
             training_targets: list[TrainingTargets] = [TrainingTargets('bsdf')]
-            if mip_level == 0 and ckpt.model.aux is not None:
+            # aux can be architecturally configured (ckpt.model.aux is not
+            # None) without having been trained yet in this job -- e.g. a
+            # checkpoint saved during BsdfDirectOptimization/decoder_repair,
+            # which runs before training_aux() ever creates the aux data
+            # generator. Skip the aux comparison plot in that case instead
+            # of crashing; there's nothing to compare against yet.
+            if mip_level == 0 and ckpt.model.aux is not None and data_generators.aux is not None:
                 training_targets += [ckpt.model.aux.targets]
             for targets in training_targets:
                 if targets.name == 'bsdf':
