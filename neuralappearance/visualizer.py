@@ -48,22 +48,66 @@ def _format_mb(num_bytes: int) -> str:
     return f'{num_bytes / 1e6:.1f} MB'
 
 
-def _latent_file_size_bytes(checkpoint_dir: Path, material_id: int, num_mip_levels: int) -> int | None:
-    """Sum the on-disk size of a material's latent EXR(s) across mip levels.
+# Every checkpoint in this repo currently uses a single UDIM tile (1001), see
+# e.g. write_condition_c_checkpoint()'s "no UDIM suffix for the single-UDIM
+# case" note in latent_ntc_roundtrip.py. Matches _latent_texture_device_bytes'
+# default below.
+_SINGLE_UDIM_ID = 1001
 
-    Matches the naming convention LatentTexture/Texture actually write
-    (``latents.material{id}.mip{level}.exr``, no UDIM suffix for the
-    single-UDIM case every checkpoint in this repo currently uses). Returns
-    None if no matching file is found, rather than raising, since this feeds
-    a UI label that should just go blank on an unexpected checkpoint layout.
+
+def _texture_list_device_bytes(material: f2.Material) -> int | None:
+    """Sum the real GPU device memory (bytes, straight from each Texture's own
+    ``memory_usage``, not inferred from any file size) across every texture a
+    native material has registered, UDIM tiles included.
+
+    Mirrors reference_materials.py's ``_detect_texture_metadata()`` traversal
+    of ``build_texture_list()``. Returns None for a material type that has no
+    such method (e.g. NeuralMaterial -- its "textures" are latent buffers,
+    not classic file-backed Texture resources, see
+    _latent_texture_device_bytes() below), so this only applies to
+    reference (MDL/MaterialX) materials.
+    """
+    if not hasattr(material, 'build_texture_list'):
+        return None
+    total = 0
+    found_any = False
+    for handle in material.build_texture_list():
+        if not handle.is_valid():
+            continue
+        if handle.is_udim():
+            for tile in handle.udim_tiles:
+                tile_handle = tile.texture_handle
+                if tile_handle is not None and tile_handle.is_valid():
+                    tex = tile_handle.texture
+                    if tex is not None:
+                        total += tex.memory_usage.device
+                        found_any = True
+        else:
+            tex = handle.texture
+            if tex is not None:
+                total += tex.memory_usage.device
+                found_any = True
+    return total if found_any else None
+
+
+def _latent_texture_device_bytes(
+    latent_texture: 'LatentTexture',
+    material_id: int,
+    num_mip_levels: int,
+    udim_id: int = _SINGLE_UDIM_ID,
+) -> int | None:
+    """Sum the real GPU device memory (bytes) of a LatentTexture's per-mip
+    texel buffers for one material, straight from each buffer's own
+    ``memory_usage`` -- the actual allocation, not a file-size proxy (unlike
+    the on-disk checkpoint EXR, the live buffer size can't drift from what's
+    really resident on the device).
     """
     total = 0
     found_any = False
     for mip_level in range(max(1, num_mip_levels)):
-        path = checkpoint_dir / f'latents.material{material_id}.mip{mip_level}.exr'
-        if path.is_file():
-            total += path.stat().st_size
-            found_any = True
+        tex = latent_texture.texture(material_id, udim_id, mip_level)
+        total += tex.buffer.storage.memory_usage.device
+        found_any = True
     return total if found_any else None
 
 
@@ -100,6 +144,45 @@ def _lookup_project3_ntc_size_bytes(checkpoint_dir: Path) -> int | None:
     with open(csv_path, newline='') as f:
         for row in csv.DictReader(f):
             if row.get('material') == material and row.get('bpp_label') == bpp_label:
+                try:
+                    return int(float(row['file_size_bytes']))
+                except (KeyError, ValueError):
+                    return None
+    return None
+
+
+def _lookup_project6_bc7_size_bytes(checkpoint_dir: Path) -> int | None:
+    """Resolve the true compressed (BC7 .dds, both channel groups) size for a
+    Project 6-style BC7-compressed checkpoint, from Project 6's own results
+    CSV. Same reasoning as _lookup_project3_ntc_size_bytes(): condition D's
+    write_condition_d_checkpoint() writes back a fully decompressed EXR, so
+    the real compressed size only exists in
+    docs/project6-rtnam-comp/results/latent_bc7_roundtrip.csv. Only resolves
+    for the exact naming convention that harness produces
+    (.../project3_<material>/checkpoints/00200000_bc7); any other
+    --compressed-checkpoint-bc7 path returns None. BC7 has no bpp sweep (one
+    fixed-rate point per material), so unlike the NTC lookup there's no
+    bpp_label to match on.
+    """
+    if checkpoint_dir.name != '00200000_bc7':
+        return None
+
+    job_dir_prefix = 'project3_'
+    job_dir_name = checkpoint_dir.parent.parent.name
+    if not job_dir_name.startswith(job_dir_prefix):
+        return None
+    material = job_dir_name[len(job_dir_prefix):]
+
+    csv_path = (
+        Path(__file__).resolve().parent.parent.parent
+        / 'docs' / 'project6-rtnam-comp' / 'results' / 'latent_bc7_roundtrip.csv'
+    )
+    if not csv_path.is_file():
+        return None
+
+    with open(csv_path, newline='') as f:
+        for row in csv.DictReader(f):
+            if row.get('material') == material:
                 try:
                     return int(float(row['file_size_bytes']))
                 except (KeyError, ValueError):
@@ -494,6 +577,18 @@ class RenderAppWindow(AppWindow):
             for _ in range(3)
         ]
 
+        # Quarter-resolution buffers for the 4-way (reference/neural/NTC/BC7) side-by-side.
+        self.fourth_w = self.window.width // 4
+        fourth_w = self.fourth_w
+        self.sbs4_tensors = [
+            spy.Tensor.empty(self.device, shape=(self.window.height, fourth_w), dtype=spy.float4)
+            for _ in range(4)
+        ]
+        self.sbs4_accumulators = [
+            GpuAccumulator(self.device, fourth_w, self.window.height, self.vis.utils_module)
+            for _ in range(4)
+        ]
+
         # Full-resolution tensors for single-view modes.
         self.neural_tensor = spy.Tensor.empty(
             self.device,
@@ -522,6 +617,8 @@ class RenderAppWindow(AppWindow):
         view_items = ['Neural only', 'Reference only', 'Side-by-side']
         if self.vis.has_compressed:
             view_items.append('Reference - Neural - Compressed')
+        if self.vis.has_compressed_bc7:
+            view_items.append('Reference - Neural - NTC - BC7')
         self.view_combobox = spy.ui.ComboBox(
             self.ui_window,
             'View',
@@ -595,12 +692,20 @@ class RenderAppWindow(AppWindow):
             position=spy.float2(2 * third_w + 10, self.label_y),
             size=spy.float2(170, 60),
         )
+        self.compressed_bc7_label = spy.ui.Window(
+            parent=self.ui.screen,
+            title='BC7',
+            position=spy.float2(3 * fourth_w + 10, self.label_y),
+            size=spy.float2(170, 60),
+        )
         self.reference_storage_text = spy.ui.Text(self.reference_label, '')
         self.neural_storage_text = spy.ui.Text(self.neural_label, '')
         self.compressed_storage_text = spy.ui.Text(self.compressed_label, '')
+        self.compressed_bc7_storage_text = spy.ui.Text(self.compressed_bc7_label, '')
         self.reference_label.visible = False
         self.neural_label.visible = False
         self.compressed_label.visible = False
+        self.compressed_bc7_label.visible = False
 
     def set_orbit(self, use_orbit: bool) -> None:
         self.use_orbit = use_orbit
@@ -629,13 +734,16 @@ class RenderAppWindow(AppWindow):
 
         if event.type == spy.MouseEventType.button_down:
             # Split pointer coordinates across the side-by-side view.
-            side_by_side = self.vis.view_mode in (2, 3)
+            side_by_side = self.vis.view_mode in (2, 3, 4)
             if self.vis.view_mode == 2:
                 panel_w = self.half_w
                 panel_idx = 1 if event.pos.x >= panel_w else 0
             elif self.vis.view_mode == 3:
                 panel_w = self.third_w
                 panel_idx = min(2, int(event.pos.x // panel_w))
+            elif self.vis.view_mode == 4:
+                panel_w = self.fourth_w
+                panel_idx = min(3, int(event.pos.x // panel_w))
             else:
                 panel_w = None
                 panel_idx = None
@@ -654,6 +762,11 @@ class RenderAppWindow(AppWindow):
             compressed_id = (
                 int(self.vis.compressed_material.material_id) if self.vis.has_compressed else None
             )
+            compressed_bc7_id = (
+                int(self.vis.compressed_bc7_material.material_id)
+                if self.vis.has_compressed_bc7
+                else None
+            )
 
             valid, material_id, uv, wi = self.trace_ray(pixel, scene)
 
@@ -661,7 +774,7 @@ class RenderAppWindow(AppWindow):
                 self.camera.width = self.window.width
                 self.camera.recompute()
 
-            if valid and material_id in (reference_id, neural_id, compressed_id):
+            if valid and material_id in (reference_id, neural_id, compressed_id, compressed_bc7_id):
                 self.vis.set_uv(uv)
                 sph = self.vis.module.cartesian_to_spherical_rad(wi)
                 self.vis.set_theta_i(sph.x)
@@ -684,11 +797,14 @@ class RenderAppWindow(AppWindow):
     def _update_render(self) -> None:
         two_way = self.vis.view_mode == 2
         three_way = self.vis.view_mode == 3
+        four_way = self.vis.view_mode == 4
 
         if self.reset_accumulation:
             for acc in self.sbs_accumulators:
                 acc.reset()
             for acc in self.sbs3_accumulators:
+                acc.reset()
+            for acc in self.sbs4_accumulators:
                 acc.reset()
             self.neural_accum.reset()
             self.ref_accum.reset()
@@ -700,20 +816,30 @@ class RenderAppWindow(AppWindow):
         self.vis.hybrid_pt_ref.set_target_material(None, material.texture_resolution)
         if self.vis.has_compressed:
             self.vis.hybrid_pt_compressed.set_target_material(None, 0)
+        if self.vis.has_compressed_bc7:
+            self.vis.hybrid_pt_compressed_bc7.set_target_material(None, 0)
 
-        if two_way or three_way:
+        if two_way or three_way or four_way:
             if two_way:
                 panel_w = self.half_w
                 panels = [
                     (self.vis.hybrid_pt_ref, self.sbs_tensors[0], self.sbs_accumulators[0], 0, 'reference'),
                     (self.vis.hybrid_pt_neural, self.sbs_tensors[1], self.sbs_accumulators[1], panel_w, 'neural'),
                 ]
-            else:
+            elif three_way:
                 panel_w = self.third_w
                 panels = [
                     (self.vis.hybrid_pt_ref, self.sbs3_tensors[0], self.sbs3_accumulators[0], 0, 'reference'),
                     (self.vis.hybrid_pt_neural, self.sbs3_tensors[1], self.sbs3_accumulators[1], panel_w, 'neural'),
                     (self.vis.hybrid_pt_compressed, self.sbs3_tensors[2], self.sbs3_accumulators[2], 2 * panel_w, 'compressed'),
+                ]
+            else:
+                panel_w = self.fourth_w
+                panels = [
+                    (self.vis.hybrid_pt_ref, self.sbs4_tensors[0], self.sbs4_accumulators[0], 0, 'reference'),
+                    (self.vis.hybrid_pt_neural, self.sbs4_tensors[1], self.sbs4_accumulators[1], panel_w, 'neural'),
+                    (self.vis.hybrid_pt_compressed, self.sbs4_tensors[2], self.sbs4_accumulators[2], 2 * panel_w, 'compressed'),
+                    (self.vis.hybrid_pt_compressed_bc7, self.sbs4_tensors[3], self.sbs4_accumulators[3], 3 * panel_w, 'compressed_bc7'),
                 ]
 
             prev_w = self.camera.width
@@ -815,7 +941,13 @@ class NeuralMaterialVisualizer:
     plot_channel: int
     plot_colormap_idx: int
 
-    def __init__(self, checkpoint: str, assets_paths: str, compressed_checkpoint: str | None = None):
+    def __init__(
+        self,
+        checkpoint: str,
+        assets_paths: str,
+        compressed_checkpoint: str | None = None,
+        compressed_checkpoint_bc7: str | None = None,
+    ):
         super().__init__()
 
         self.device = spy.Device(
@@ -932,9 +1064,45 @@ class NeuralMaterialVisualizer:
             self.compressed_material = self.compressed_scene.create_material(NeuralMaterial)
             self.compressed_material.name = 'compressed_material'
 
+        # Optional fourth instance: a second compressed checkpoint (e.g.
+        # Project 6's BC7-swapped-latent condition D) previewed as a fourth
+        # panel alongside reference/neural/NTC-compressed. Same loading
+        # pattern as compressed_checkpoint above. Requires compressed_checkpoint
+        # to also be set -- BC7 is an additional panel next to NTC's, not a
+        # replacement for it (enforced by the CLI, see __main__ below).
+        self.has_compressed_bc7 = compressed_checkpoint_bc7 is not None
+        self.compressed_bc7_model: NeuralModelCheckpoint | None = None
+        self.compressed_bc7_scene = None
+        self.compressed_bc7_material = None
+        self.compressed_bc7_checkpoint_dir = None
+        self.checkpoint_reference_materials_compressed_bc7 = None
+        if self.has_compressed_bc7:
+            compressed_bc7_config_path, compressed_bc7_model_path = _resolve_checkpoint_paths(
+                compressed_checkpoint_bc7
+            )
+            self.compressed_bc7_checkpoint_dir = compressed_bc7_model_path.parent
+            compressed_bc7_checkpoint_config = load_config(compressed_bc7_config_path)
+            compressed_bc7_model_config = copy.deepcopy(compressed_bc7_checkpoint_config)
+            self.checkpoint_reference_materials_compressed_bc7 = ReferenceMaterials.from_config(
+                compressed_bc7_model_config
+            )
+            compressed_bc7_model = NeuralModel(
+                training_module,
+                compressed_bc7_model_config,
+                self.checkpoint_reference_materials_compressed_bc7,
+            )
+            compressed_bc7_model.load_checkpoint(compressed_bc7_model_path)
+            self.compressed_bc7_model = compressed_bc7_model.get_checkpoint()
+
+            self.compressed_bc7_scene = create_testscene(self.device)
+            self.compressed_bc7_material = self.compressed_bc7_scene.create_material(NeuralMaterial)
+            self.compressed_bc7_material.name = 'compressed_bc7_material'
+
         self.scenes = [self.ref_scene, self.neural_scene]
         if self.has_compressed:
             self.scenes.append(self.compressed_scene)
+        if self.has_compressed_bc7:
+            self.scenes.append(self.compressed_bc7_scene)
 
         self.num_mip_levels = self.neural_model.num_mip_levels
 
@@ -956,6 +1124,12 @@ class NeuralMaterialVisualizer:
             self.hybrid_pt_compressed = HybridPathTracer(self.device)
             self.hybrid_pt_compressed.max_depth = config_max_depth
             self.hybrid_pt_compressed.scene = self.compressed_scene
+
+        self.hybrid_pt_compressed_bc7 = None
+        if self.has_compressed_bc7:
+            self.hybrid_pt_compressed_bc7 = HybridPathTracer(self.device)
+            self.hybrid_pt_compressed_bc7.max_depth = config_max_depth
+            self.hybrid_pt_compressed_bc7.scene = self.compressed_bc7_scene
 
         self.module: Any = spy.Module.load_from_file(self.device, 'visualizer/visualizer.slang')
         self.module_neural: Any = spy.Module.load_from_file(
@@ -1001,9 +1175,13 @@ class NeuralMaterialVisualizer:
         return self.neural_scene if use_neural else self.ref_scene
 
     def scene_for_panel(self, panel_idx: int, view_mode: int):
-        """Return the scene for one panel of a side-by-side view (2- or 3-way)."""
+        """Return the scene for one panel of a side-by-side view (2-, 3-, or 4-way)."""
         if view_mode == 2:
             return (self.ref_scene, self.neural_scene)[panel_idx]
+        if view_mode == 4:
+            return (
+                self.ref_scene, self.neural_scene, self.compressed_scene, self.compressed_bc7_scene
+            )[panel_idx]
         return (self.ref_scene, self.neural_scene, self.compressed_scene)[panel_idx]
 
     def scene_module(self, scene: f2.Scene) -> spy.Module:
@@ -1036,17 +1214,28 @@ class NeuralMaterialVisualizer:
 
         is_neural = panel != 'reference'
         is_compressed = panel == 'compressed'
-        model = self.compressed_model if is_compressed else self.neural_model
-        neural_material = self.compressed_material if is_compressed else self.neural_material
-        checkpoint_reference_materials = (
-            self.checkpoint_reference_materials_compressed
-            if is_compressed
-            else self.checkpoint_reference_materials
-        )
+        is_compressed_bc7 = panel == 'compressed_bc7'
+        if is_compressed_bc7:
+            model = self.compressed_bc7_model
+            neural_material = self.compressed_bc7_material
+            checkpoint_reference_materials = self.checkpoint_reference_materials_compressed_bc7
+        elif is_compressed:
+            model = self.compressed_model
+            neural_material = self.compressed_material
+            checkpoint_reference_materials = self.checkpoint_reference_materials_compressed
+        else:
+            model = self.neural_model
+            neural_material = self.neural_material
+            checkpoint_reference_materials = self.checkpoint_reference_materials
         assert not is_neural or model.aux is not None
 
         material = self.reference_materials[self.material_idx]
-        scene = self.compressed_scene if is_compressed else self.scene_for(is_neural)
+        if is_compressed_bc7:
+            scene = self.compressed_bc7_scene
+        elif is_compressed:
+            scene = self.compressed_scene
+        else:
+            scene = self.scene_for(is_neural)
         material_id = int(neural_material.material_id) if is_neural else int(material.backend_id)
         hit_kernel = self._get_hit_kernel(scene, material_id)
 
@@ -1159,42 +1348,85 @@ class NeuralMaterialVisualizer:
             )
             prepare_scene_material(self.compressed_scene, self.compressed_material)
 
+        if self.has_compressed_bc7:
+            checkpoint_mat_compressed_bc7 = self.checkpoint_reference_materials_compressed_bc7[
+                self.material_idx
+            ]
+            self.compressed_bc7_material.configure(
+                self.device,
+                self.compressed_bc7_model,
+                checkpoint_mat_compressed_bc7.id,
+            )
+            prepare_scene_material(self.compressed_bc7_scene, self.compressed_bc7_material)
+
         self._scene_module_cache.clear()
         self._hit_kernel_cache.clear()
         self._update_storage_labels()
 
     def _update_storage_labels(self) -> None:
-        """Refresh each side-by-side label's latent storage size for the
-        currently selected material. Reference has no latent texture at all,
-        so its line stays blank; Neural and Compressed show the on-disk size
-        of the latent EXR actually loaded for that panel. For a Project
-        3-style compressed checkpoint, a second line adds the true compressed
-        (.ntc) size looked up from that project's own results CSV -- the
-        checkpoint directory itself only ever holds the decompressed EXR, see
-        _lookup_project3_ntc_size_bytes()."""
+        """Refresh each side-by-side label's real GPU memory usage for the
+        currently selected material, queried straight from each panel's own
+        GPU resources rather than inferred from a file size on disk.
+
+        Reference sums its MDL/MaterialX material's actual texture memory
+        (_texture_list_device_bytes(), same build_texture_list() traversal
+        reference_materials.py already uses to detect UDIMs/resolution).
+        Neural/Compressed/Compressed-BC7 sum their latent texture's per-mip
+        buffer allocations (_latent_texture_device_bytes()) -- previously
+        this line only showed the on-disk checkpoint EXR's size, and
+        Reference showed nothing at all, since it has no such EXR to measure.
+        A second line on the compressed panels adds the true compressed-file
+        size (.ntc / BC7 .dds) looked up from that project's own results CSV
+        -- the checkpoint directory itself only ever holds the decompressed
+        EXR, see _lookup_project3_ntc_size_bytes() /
+        _lookup_project6_bc7_size_bytes()."""
         rw = self.render_window
         checkpoint_mat = self.checkpoint_reference_materials[self.material_idx]
 
-        neural_bytes = _latent_file_size_bytes(
-            self.checkpoint_dir, checkpoint_mat.id, self.num_mip_levels
+        ref_material = self.reference_materials[self.material_idx]
+        ref_bytes = _texture_list_device_bytes(ref_material.falcor2_handle)
+        rw.reference_storage_text.text = f'GPU: {_format_mb(ref_bytes)}' if ref_bytes is not None else ''
+
+        neural_bytes = _latent_texture_device_bytes(
+            self.neural_model.latent_texture, checkpoint_mat.id, self.num_mip_levels
         )
-        rw.neural_storage_text.text = _format_mb(neural_bytes) if neural_bytes is not None else ''
-        rw.reference_storage_text.text = ''
+        rw.neural_storage_text.text = (
+            f'GPU: {_format_mb(neural_bytes)}' if neural_bytes is not None else ''
+        )
 
         if self.has_compressed:
             checkpoint_mat_compressed = self.checkpoint_reference_materials_compressed[
                 self.material_idx
             ]
-            compressed_bytes = _latent_file_size_bytes(
-                self.compressed_checkpoint_dir, checkpoint_mat_compressed.id, self.num_mip_levels
+            compressed_bytes = _latent_texture_device_bytes(
+                self.compressed_model.latent_texture,
+                checkpoint_mat_compressed.id,
+                self.num_mip_levels,
             )
-            lines = [_format_mb(compressed_bytes)] if compressed_bytes is not None else []
+            lines = [f'GPU: {_format_mb(compressed_bytes)}'] if compressed_bytes is not None else []
             ntc_bytes = _lookup_project3_ntc_size_bytes(self.compressed_checkpoint_dir)
             if ntc_bytes is not None:
                 lines.append(f'.ntc: {_format_mb(ntc_bytes)}')
             rw.compressed_storage_text.text = '\n'.join(lines)
         else:
             rw.compressed_storage_text.text = ''
+
+        if self.has_compressed_bc7:
+            checkpoint_mat_compressed_bc7 = self.checkpoint_reference_materials_compressed_bc7[
+                self.material_idx
+            ]
+            compressed_bc7_bytes = _latent_texture_device_bytes(
+                self.compressed_bc7_model.latent_texture,
+                checkpoint_mat_compressed_bc7.id,
+                self.num_mip_levels,
+            )
+            lines = [f'GPU: {_format_mb(compressed_bc7_bytes)}'] if compressed_bc7_bytes is not None else []
+            bc7_bytes = _lookup_project6_bc7_size_bytes(self.compressed_bc7_checkpoint_dir)
+            if bc7_bytes is not None:
+                lines.append(f'BC7: {_format_mb(bc7_bytes)}')
+            rw.compressed_bc7_storage_text.text = '\n'.join(lines)
+        else:
+            rw.compressed_bc7_storage_text.text = ''
 
     def set_show_ui(self, show_ui: bool) -> None:
         self.show_ui = show_ui
@@ -1209,7 +1441,12 @@ class NeuralMaterialVisualizer:
         self.apply_view_mode()
 
     def set_view_mode(self, view_mode: int) -> None:
-        max_mode = 3 if self.has_compressed else 2
+        if self.has_compressed_bc7:
+            max_mode = 4
+        elif self.has_compressed:
+            max_mode = 3
+        else:
+            max_mode = 2
         view_mode = max(0, min(max_mode, view_mode))
         self.view_mode = view_mode
         self.show_neural = view_mode != 1
@@ -1235,20 +1472,40 @@ class NeuralMaterialVisualizer:
     def _update_side_by_side_labels(self) -> None:
         rw = self.render_window
         three_way = self.view_mode == 3
-        visible = self.show_ui and self.view_mode in (2, 3)
+        four_way = self.view_mode == 4
+        visible = self.show_ui and self.view_mode in (2, 3, 4)
 
-        neural_x = rw.third_w if three_way else rw.half_w
+        if four_way:
+            panel_w = rw.fourth_w
+        elif three_way:
+            panel_w = rw.third_w
+        else:
+            panel_w = rw.half_w
+        neural_x = panel_w
+
         rw.reference_label.position = spy.float2(10, rw.label_y)
         rw.neural_label.position = spy.float2(neural_x + 10, rw.label_y)
-        rw.compressed_label.position = spy.float2(2 * rw.third_w + 10, rw.label_y)
+        rw.compressed_label.position = spy.float2(2 * panel_w + 10, rw.label_y)
+        rw.compressed_bc7_label.position = spy.float2(3 * panel_w + 10, rw.label_y)
 
         rw.reference_label.visible = visible
         rw.neural_label.visible = visible
-        rw.compressed_label.visible = self.show_ui and three_way
+        rw.compressed_label.visible = self.show_ui and (three_way or four_way)
+        rw.compressed_bc7_label.visible = self.show_ui and four_way
+        # Disambiguate the two compressed panels once BC7 is also present --
+        # "Compressed" stays the label in 3-way mode (single-compressed-checkpoint
+        # usage unchanged), becomes "NTC" once a fourth, BC7 panel sits next to it.
+        rw.compressed_label.title = 'NTC' if self.has_compressed_bc7 else 'Compressed'
 
     @property
     def render_title(self) -> str:
-        view_titles = ('Neural', 'Reference', 'Reference | Neural', 'Reference | Neural | Compressed')
+        view_titles = (
+            'Neural',
+            'Reference',
+            'Reference | Neural',
+            'Reference | Neural | Compressed',
+            'Reference | Neural | NTC | BC7',
+        )
         return f'{view_titles[self.view_mode]} - {self.signal_names[self.signal_idx]}'
 
     def set_material_idx(self, material_idx: int) -> None:
@@ -1409,9 +1666,29 @@ if __name__ == '__main__':
         'side-by-side view. Same config.json as --checkpoint/--jobs, so it needs the '
         'same --assets-paths, not a separate one.',
     )
+    parser.add_argument(
+        '--compressed-checkpoint-bc7',
+        type=str,
+        default=None,
+        help='Optional path to a third checkpoint directory (Project 6\'s BC7-swapped-'
+        'latent condition D checkpoint, 00200000_bc7) to compare as a fourth "BC7" '
+        'panel alongside reference/neural/NTC. Requires --compressed-checkpoint to '
+        'also be set -- this adds a panel next to NTC\'s, it does not replace it.',
+    )
     args = parser.parse_args()
+
+    if args.compressed_checkpoint_bc7 and not args.compressed_checkpoint:
+        parser.error(
+            '--compressed-checkpoint-bc7 requires --compressed-checkpoint as well '
+            '(BC7 is a fourth panel alongside NTC, not a replacement for it)'
+        )
 
     checkpoint = args.checkpoint if args.checkpoint else find_latest_checkpoint(args.jobs)
 
-    app = NeuralMaterialVisualizer(checkpoint, args.assets_paths, args.compressed_checkpoint)
+    app = NeuralMaterialVisualizer(
+        checkpoint,
+        args.assets_paths,
+        args.compressed_checkpoint,
+        args.compressed_checkpoint_bc7,
+    )
     app.main_loop()
