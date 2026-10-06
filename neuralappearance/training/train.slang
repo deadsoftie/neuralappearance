@@ -131,6 +131,71 @@ float eval_diropt_model_and_loss<
 }
 
 
+// Fit a freshly-initialized NtcLatentTexture (grid pair + decode MLP) to
+// reproduce the frozen, already-trained encoder's output field, before
+// `train_bsdf_diropt` takes over to jointly fine-tune grid, decode MLP,
+// and BsdfDecoder against the real BSDF loss. New phase, additive --
+// `train_bsdf_encoding` and `train_bsdf_diropt` above are untouched, and
+// this one only runs when `training.py`'s `training_ntc_warmstart()` is
+// invoked, which only happens for the `ntc_grid` latents path.
+void train_ntc_warmstart<
+    int NumEncoderInputs,
+    int NumLatents,
+    Encoder : IEncoder<NumEncoderInputs, NumLatents>,
+    NtcTex : ILatentTexture<NumLatents>
+>(
+    no_diff Encoder encoder,
+    NtcTex ntc_latents,
+    TrainingSample<3, NumEncoderInputs> sample,
+    float loss_scale,
+    int2 call_id,
+    RWTensor<float2, 2> loss_buffer
+)
+{
+    NeuralConfig::set_batch_index(call_id.x);
+
+    bwd_diff(eval_ntc_warmstart_and_loss<NumEncoderInputs, NumLatents, Encoder, NtcTex>)(
+        encoder,
+        ntc_latents,
+        sample,
+        call_id,
+        loss_buffer,
+        loss_scale
+    );
+}
+
+[BackwardDifferentiable]
+float eval_ntc_warmstart_and_loss<
+    int NumEncoderInputs,
+    int NumLatents,
+    Encoder : IEncoder<NumEncoderInputs, NumLatents>,
+    NtcTex : ILatentTexture<NumLatents>
+>(
+    no_diff Encoder encoder,
+    NtcTex ntc_latents,
+    no_diff TrainingSample<3, NumEncoderInputs> sample,
+    int2 loss_id,
+    RWTensor<float2, 2> loss_buffer
+)
+{
+    float[NumLatents] target = encoder.forward({ sample.material_id, sample.encoder_inputs });
+    float[NumLatents] prediction = ntc_latents.get_nearest({ sample.material_id, sample.mip_level, sample.uv });
+
+    float loss = 0.f;
+    [ForceUnroll]
+    for (int i = 0; i < NumLatents; ++i)
+    {
+        float diff = prediction[i] - detach(target[i]);
+        loss += diff * diff;
+    }
+    loss /= float(NumLatents);
+
+    float loss_sum = loss_buffer[loss_id].y;
+    loss_buffer[loss_id] = float2(loss, loss_sum + loss);
+    return loss;
+}
+
+
 // Main entry point from Python for training the sampler.
 void train_sampler<
     int NumLatents,

@@ -6,6 +6,7 @@ implementing neural_networks;
 
 __include components.elu;
 __include components.exp;
+__include components.hard_gelu;
 __include components.identity;
 __include components.leaky_relu;
 __include components.relu;

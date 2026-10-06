@@ -83,6 +83,11 @@ class ELU(Activation):
         return {'a': self.a}
 
 
+class HardGELU(Activation):
+    def __init__(self, width: AutoSettable[int] = Auto, dtype: AutoSettable[Real] = Auto):
+        super().__init__('HardGELU', width, dtype)
+
+
 class SmeLU(Activation):
     def __init__(self, width: AutoSettable[int] = Auto, dtype: AutoSettable[Real] = Auto):
         super().__init__('SmeLU', width, dtype)

@@ -52,6 +52,39 @@ struct Texture<int NumChannels>
         return result;
     }
 
+    // Learned 4-neighbor-concat interpolation (NTC's "G0" sampling mode,
+    // docs/deep-dives/dd3-ntc.md Sec 4.3): unlike ``get_bilinear``, which
+    // blends the four neighbors, this concatenates them so a later MLP layer
+    // can combine them differently depending on exact texel position.
+    // Reuses the exact same differentiable per-texel fetch as ``get_bilinear``
+    // (``_get_code``/``_get_code_bwd``) -- no new backward derivative needed.
+    [BackwardDifferentiable]
+    float[4 * NumChannels] get_4neighbor_concat(float2 uv)
+    {
+        uint2 texels[4];
+        float weights[4];
+        get_bilinear_interpolation_texels_and_weights(
+            uv,
+            uint2(this.resolution),
+            this.wrap,
+            texels,
+            weights
+        );
+
+        float[4 * NumChannels] result;
+        [ForceUnroll]
+        for (int i = 0; i < 4; ++i)
+        {
+            float[NumChannels] code = _get_code(texels[i]);
+            [ForceUnroll]
+            for (int l = 0; l < NumChannels; ++l)
+                result[i * NumChannels + l] = code[l];
+        }
+        if (!optimizable)
+            result = detach(result);
+        return result;
+    }
+
     [BackwardDifferentiable]
     float[NumChannels] get_bilinear_stochastic(float2 uv, float sample)
     {

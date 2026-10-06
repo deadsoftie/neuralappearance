@@ -4,6 +4,7 @@
 // clang-format off
 import neural_networks;
 import base_types;
+import util.math_helpers;
 
 
 // Generic interface for the rotation module.
@@ -100,8 +101,13 @@ struct ShadingFrameRotation<
 
             // t is normalized but not made orthogonal to n. b supplies the
             // third projection axis from their cross product.
-            n = normalize(n);
-            t = normalize(t);
+            //
+            // rotation_decoder has no bias/hidden layers, so its residual is
+            // unbounded and can land close enough to the canonical offset's
+            // negation that n or t is near-zero here -- plain normalize()
+            // would then amplify tiny input noise into huge frame swings.
+            n = safe_normalize(n);
+            t = safe_normalize(t);
             float3 b = cross(n, t);
 
             params[i].t = t;

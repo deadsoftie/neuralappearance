@@ -18,7 +18,14 @@ from .aux_decoder import AuxDecoder
 from .bsdf_decoder import BsdfDecoder
 from .encoder import Encoder
 from .latent_texture import LatentTexture
+from .ntc_latent_texture import NtcLatentTexture
 from .sampler import Sampler
+
+# Both store per-material spatial state directly (grid/texel buffers) rather
+# than through a `children()` model, so `InstancedComponent` special-cases
+# either one the same way everywhere it needs to tell a latent-texture
+# component apart from a decoder/encoder/sampler/aux candidate pool.
+LatentTextureTypes = (LatentTexture, NtcLatentTexture)
 
 if TYPE_CHECKING:
     from datagen import ReferenceMaterials
@@ -40,7 +47,7 @@ class InstancedComponent[T: nn.IModel]:
         return list(self.instances)
 
     def checkpoint_instance(self, best_instance_index: int) -> nn.IModel | None:
-        if isinstance(self.instances[0], LatentTexture):
+        if isinstance(self.instances[0], LatentTextureTypes):
             # Always return the single latent texture instance.
             return self.instances[0]
         if self.status == 'Initialized':
@@ -66,7 +73,7 @@ class InstancedComponent[T: nn.IModel]:
 
     def start_training(self) -> int | None:
         self.status = 'Training'
-        if isinstance(self.instances[0], LatentTexture):
+        if isinstance(self.instances[0], LatentTextureTypes):
             # Keep a single instance, but make sure it is optimizable. This
             # might allocate additional buffers to hold gradients.
             self.instances[0].make_optimizable()
@@ -126,12 +133,42 @@ class NeuralModel:
 
         # The latent texture contains a compressed, non-interpretable
         # representation of all spatially-varying material properties.
-        latent_texture = LatentTexture.from_reference_materials(
-            reference_materials,
-            self.config['model']['latents']['num_mip_levels'],
-            self.config['model']['latents']['num_channels'],
-            optimizable=False,
-        )
+        # `"dense"` (default) is RTNAM's own per-texel buffer, unchanged.
+        # `"ntc_grid"` (rtcnam/PLAN.md) swaps in a pair of lower-resolution
+        # feature grids decoded by a small MLP, matching NVIDIA's shipped
+        # RTXNTC SDK's grid-shape/quantization recipe; every downstream
+        # consumer (decoders, training kernels, renderer, visualizer) goes
+        # through the same `ILatentTexture` interface either way.
+        latents_config = self.config['model']['latents']
+        latents_type = latents_config.get('type', 'dense')
+        if latents_type == 'dense':
+            latent_texture = LatentTexture.from_reference_materials(
+                reference_materials,
+                latents_config['num_mip_levels'],
+                latents_config['num_channels'],
+                optimizable=False,
+            )
+        elif latents_type == 'ntc_grid':
+            if latents_config['num_mip_levels'] != 1:
+                raise ValueError(
+                    'model.latents.type "ntc_grid" only supports num_mip_levels == 1 '
+                    '(the grid pair itself provides the high/low-res pyramid; stacking '
+                    "RTNAM's own multi-mip Russian-roulette filtering on top is not "
+                    'implemented -- see rtcnam/PLAN.md, "Risks").'
+                )
+            ntc_config = latents_config['ntc_grid']
+            latent_texture = NtcLatentTexture.from_reference_materials(
+                reference_materials,
+                latents_config['num_channels'],
+                ntc_config['grid_size_scale'],
+                ntc_config['num_features'],
+                ntc_config.get('num_pos_enc_waves', 3),
+                ntc_config['decoder_hidden_layers'],
+                ntc_config.get('decoder_activation', 'HardGELU'),
+                optimizable=False,
+            )
+        else:
+            raise ValueError(f'Unknown model.latents.type: {latents_type!r}')
         latent_texture.initialize(self.module)
 
         # Only a single instance exists for the latent texture.

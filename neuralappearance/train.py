@@ -32,7 +32,7 @@ from datagen import (
     SamplerDataGenerator,
     create_aux_data_generator,
 )
-from model import NeuralModel
+from model import NeuralModel, NtcLatentTexture
 from rendering import Renderer
 from rendering.pathtracer_helpers import create_testscene
 from slangpy.core.native import Shape
@@ -853,6 +853,13 @@ def training_main(args) -> None:
     )
 
     training_bsdf_encoding(job)
+    if isinstance(neural_model.latent_texture.instances[0], NtcLatentTexture):
+        # rtcnam/PLAN.md: warm-start the grid + decode MLP to reproduce the
+        # just-trained encoder's output field before direct optimization
+        # (next) fine-tunes grid, decode MLP, and BsdfDecoder jointly
+        # against the real BSDF loss. Only runs for the `ntc_grid` latents
+        # path; the stock `dense` path is unaffected.
+        training_ntc_warmstart(job)
     training_bsdf_diropt(job)
     training_sampler(job)
     training_aux(job)
@@ -953,6 +960,95 @@ def training_bsdf_encoding(job: TrainingJob) -> None:
     neural_model.decoder.status = 'Done'
     neural_model.encoder.status = 'Done'
     neural_model.latent_texture.status = 'Done'
+
+
+def training_ntc_warmstart(job: TrainingJob) -> None:
+    """Warm-start an `NtcLatentTexture` (grid pair + decode MLP) to
+    reproduce the frozen, already-trained encoder's output field.
+
+    rtcnam/PLAN.md, "Decisions" #1: the grid is seeded by running RTNAM's
+    existing encoder (bootstrap path), not from pure random init. But the
+    encoder's own output (`num_latents` channels, e.g. 8) and the grid's
+    cell contents (`num_features` channels, e.g. 8 or 16 depending on the
+    bpp preset) are generally different widths, and even where they
+    coincidentally match, a freshly-initialized decode MLP would not pass
+    grid values through to its output in any structured way -- so
+    "seeding" here means an actual short regression (grid + decode MLP
+    trained from scratch against an L2 loss to reproduce the encoder's
+    per-sample output), not a copy. `train_bsdf_diropt` (next) then takes
+    over to fine-tune grid, decode MLP, and BsdfDecoder jointly against
+    the real BSDF loss, starting from this warm-started point rather than
+    from scratch.
+
+    Reuses `job.data_generators.bsdf` as-is: at this point in the job it is
+    still the `'BsdfEncoding'`-configured generator (the one that fills
+    real `encoder_inputs`), since `training_bsdf_diropt()` is the function
+    that replaces it with a `'BsdfDirectOptimization'`-configured one --
+    and that replacement happens after this phase runs.
+    """
+
+    neural_model = job.neural_model
+    module = job.module
+    config = job.config
+    phase_state = job.begin_phase('BsdfDirectOptimization', detail='ntc_warmstart')
+
+    print()
+
+    assert isinstance(neural_model.latent_texture.instances[0], NtcLatentTexture)
+    assert neural_model.encoder is not None and neural_model.encoder.status == 'Done', (
+        'NTC grid warm-start requires a already-trained encoder to regress against.'
+    )
+
+    num_iterations = config['model']['latents']['ntc_grid'].get('warmstart_iterations', 20000)
+    if num_iterations == 0:
+        print('No ntc_grid warmstart iterations configured, skipping "training_ntc_warmstart()".')
+        return
+
+    lr_scheduler = CosineAnnealingLRScheduler(
+        start_scale=1.0,
+        end_scale=min(1.0, config['training']['optimizer']['cosine_annealing_scale']),
+        num_iterations=num_iterations,
+    )
+    configured_batch_instance_scheduler = BatchInstanceScheduler(
+        config['training']['instance_schedule'], config['data_generation']['batch_size_schedule']
+    )
+    batch_instance_scheduler = BatchInstanceScheduler(
+        [neural_model.num_instances], [configured_batch_instance_scheduler.batch_sizes[-1]]
+    )
+
+    neural_model.start_training(neural_model.latent_texture)
+
+    assert neural_model.num_instances == 1, (
+        'NTC grid warm-start expects a single pruned encoder/decoder instance, '
+        'same as any post-encoding finetuning phase.'
+    )
+
+    train_ntc_warmstart = module.train_ntc_warmstart.as_func().map(
+        encoder=(0,), ntc_latents=(0,), sample=(0, 1)
+    )
+
+    def run_train_kernel(phase_runtime, sample, iteration_block):
+        train_ntc_warmstart(
+            encoder=neural_model.encoder_buffer,
+            ntc_latents=neural_model.latent_texture_buffer,
+            sample=sample,
+            loss_scale=phase_runtime.loss_scale,
+            call_id=spy.call_id(),
+            loss_buffer=phase_runtime.loss_buffer.tensor,
+            _append_to=iteration_block.train_cmd,
+        )
+
+    job.run_phase_optimization(
+        phase_state=phase_state,
+        lr_scheduler=lr_scheduler,
+        batch_instance_scheduler=batch_instance_scheduler,
+        data_generator=job.data_generators.bsdf,
+        run_train_kernel=run_train_kernel,
+    )
+
+    # Deliberately left as 'Training', not 'Done': `training_bsdf_diropt()`
+    # runs next and calls `neural_model.start_training(neural_model.latent_texture)`
+    # itself, which resets the status regardless.
 
 
 def training_bsdf_diropt(job: TrainingJob) -> None:
