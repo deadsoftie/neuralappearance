@@ -37,6 +37,42 @@
             "type": "L1WithPowerLog",
             "power": 3.0,
             "epsilon": 1e-4
+        },
+        // rtcnam coverage penalty (train.slang eval_diropt_model_and_loss,
+        // rtcnam/NTC_LATENT_TEXTURE_NOTES.md): during bsdf_finetuning,
+        // penalizes BsdfDecoder luminance above `cap` at an extra random
+        // uniform-hemisphere (wi, wo) sample per iteration, to keep it from
+        // developing out-of-distribution spikes that indirect path-traced
+        // bounces (sampled via the trained Sampler, not this training
+        // distribution) can land on and blow up multiplicatively.
+        // Tuning history on carpaint_metallic (not monotonic -- see below):
+        //   weight=0.01,  cap=50 -> render max 1.1e37, 51% of pixels >10x ref
+        //   weight=1.0,   cap=10 -> render max 2.6e27, 26%
+        //   weight=100,   cap=5  -> render max 9.4e12, 13%  <- best found
+        //   weight=10000, cap=5  -> render max 5.6e27, 51%  (regressed!)
+        // Not a dial to max out: one regularizer sample/iteration is a
+        // sparse signal over a 4D (wi,wo) domain, and too strong a pull
+        // toward wherever THAT iteration's one sample lands can make
+        // training chase it around ("whack-a-mole") rather than settle
+        // into a globally smooth decoder, while the main BSDF loss stays
+        // perfectly stable throughout (~0.18-0.20) regardless of weight --
+        // this is real non-convergence of the regularizer's own objective,
+        // not training instability. weight=100/cap=5 is the best of these
+        // four; still not fully sane (positive PSNR), a real but partial
+        // mitigation. cap=5 matches this material's actual peak BSDF value
+        // -- the tightest physically-defensible choice, not loosened for
+        // headroom.
+        // DISABLED pending re-evaluation. This penalty was targeting a
+        // symptom (high decoder luminance at off-manifold angles). The
+        // actual cause was found to be latent saturation from the
+        // `normalize_latent_code` squash in ntc_latent_texture.slang, now
+        // replaced by a non-saturating leaky clamp. Re-test with the
+        // penalty off first to measure the latent fix in isolation; only
+        // re-enable if a luminance tail survives it.
+        "coverage_penalty": {
+            "weight": 0.0,
+            "cap": 5.0,
+            "samples": 8
         }
     },
 

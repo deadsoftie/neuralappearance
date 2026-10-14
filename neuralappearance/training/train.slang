@@ -84,7 +84,14 @@ void train_bsdf_diropt<
     float loss_scale,
     int2 call_id,
     RWTensor<float2, 2> loss_buffer,
-    LossFunction loss_function
+    LossFunction loss_function,
+    // rtcnam: optional coverage-penalty regularizer (see
+    // eval_diropt_model_and_loss below). weight=0 (every existing config,
+    // including every dense-path one) reproduces this function's exact
+    // prior behavior bit-for-bit -- the extra term is `0 * (...)^2 = 0`,
+    // added to a float, so it is a true no-op, not just "small".
+    float coverage_penalty_weight = 0.f,
+    float coverage_penalty_cap = 0.f
 )
 {
     NeuralConfig::set_batch_index(call_id.x);
@@ -104,6 +111,8 @@ void train_bsdf_diropt<
         loss_buffer,
         sg,
         loss_function,
+        coverage_penalty_weight,
+        coverage_penalty_cap,
         loss_scale
     );
 }
@@ -122,12 +131,73 @@ float eval_diropt_model_and_loss<
     int2 loss_id,
     RWTensor<float2, 2> loss_buffer,
     inout UniformSampleGenerator sg,
-    LossFunction loss_function
+    LossFunction loss_function,
+    no_diff float coverage_penalty_weight,
+    no_diff float coverage_penalty_cap
 )
 {
     float[NumLatents] latents = latent_texture.get_nearest({ sample.material_id, sample.mip_level, sample.uv });
     float prediction[3] = decoder.forward({ sample.material_id, sample.mip_level, latents, sample.wi, sample.wo });
-    return eval_and_store_loss<3, NumEncoderInputs>(prediction, sample, loss_id, loss_buffer, loss_function);
+    float loss = eval_and_store_loss<3, NumEncoderInputs>(prediction, sample, loss_id, loss_buffer, loss_function);
+
+    // rtcnam coverage penalty. NOTE: the diagnosis below is SUPERSEDED --
+    // the render blowup it describes was actually caused by latent
+    // saturation from a squash applied in ntc_latent_texture.slang, since
+    // replaced by a non-saturating leaky clamp, and this penalty was
+    // treating a symptom. It is retained (disabled, weight 0) because its
+    // tuning data is informative about the residual tail and it may still
+    // be worth re-enabling. See rtcnam/NTC_LATENT_TEXTURE_NOTES.md for the
+    // corrected analysis. Original rationale, kept for context:
+    // BsdfDecoder, continuing to train jointly with a grid-derived latent
+    // for `bsdf_finetuning` iterations, was observed to develop large
+    // extrapolation spikes (luminance up to ~1e5, vs. the real material's
+    // actual peak of ~5) at (wi, wo) pairs outside the directional
+    // distribution `sample` is drawn from. Indirect path-tracing bounces
+    // sample their outgoing direction from the trained *Sampler*, not from
+    // this same training distribution, and routinely land in exactly that
+    // unsafe region -- producing an importance weight (bsdf / pdf) that is
+    // enormous but finite, so it passes the renderer's own isinf/isnan
+    // guard and compounds multiplicatively over up to `max_depth` bounces.
+    // Probed directly (not simulated): capping the decoder's output alone,
+    // without this penalty, did not fix it -- the sampler had already
+    // learned to concentrate exactly on the spike. This penalty instead
+    // directly discourages the spike from forming during the training
+    // that creates it: alongside the main sample, evaluate the SAME frozen
+    // `latents` at one extra direction pair drawn from the uniform-
+    // hemisphere distribution the diagnostic probe used (independent of
+    // `sample.wi`/`sample.wo`), and penalize luminance above
+    // `coverage_penalty_cap` with a one-sided quadratic hinge. Zero weight
+    // (the default, and every config that doesn't opt in) makes this an
+    // exact no-op below.
+    //
+    // DO NOT reintroduce a dynamic-trip-count loop here to average several
+    // draws per iteration. That was tried (`[MaxIters(8)]` over a runtime
+    // `coverage_penalty_samples`) and it hangs the GPU: 4 of 4 full-scale
+    // runs with that loop present died in this phase, versus 4 of 4
+    // completing without it, and the failure reproduced on a freshly
+    // rebooted machine as a hard `VK_ERROR_DEVICE_LOST` (TDR) rather than
+    // just a stall. Critically it hung even with `coverage_penalty_weight`
+    // at 0, i.e. with the loop body never executing -- so the mere presence
+    // of the dynamic loop makes Slang emit reverse-mode code that spins on
+    // the GPU, not anything about the penalty math. If multi-sampling is
+    // ever wanted, unroll it over a compile-time generic with
+    // `[ForceUnroll]` instead of a runtime bound, and re-validate a full
+    // run end to end before trusting it.
+    if (coverage_penalty_weight > 0.f)
+    {
+        float3 wi2 = no_diff sample_hemisphere(next_float2(sg));
+        float3 wo2 = no_diff sample_hemisphere(next_float2(sg));
+        float coverage_prediction[3] = decoder.forward({
+            sample.material_id, sample.mip_level, latents, wi2, wo2
+        });
+        float luminance = 0.2126f * coverage_prediction[0]
+            + 0.7152f * coverage_prediction[1]
+            + 0.0722f * coverage_prediction[2];
+        float excess = max(0.f, luminance - coverage_penalty_cap);
+        loss += coverage_penalty_weight * excess * excess;
+    }
+
+    return loss;
 }
 
 
@@ -178,6 +248,10 @@ float eval_ntc_warmstart_and_loss<
     RWTensor<float2, 2> loss_buffer
 )
 {
+    // `latents.normalize` is false on this path (see ntc_latent_texture.slang
+    // and `training_bsdf_diropt`'s assert), so the encoder does not squash and
+    // this regression runs in the same unsquashed space the grid outputs and
+    // `BsdfDecoder` consumes -- unit gradient throughout, no inverse needed.
     float[NumLatents] target = encoder.forward({ sample.material_id, sample.encoder_inputs });
     float[NumLatents] prediction = ntc_latents.get_nearest({ sample.material_id, sample.mip_level, sample.uv });
 

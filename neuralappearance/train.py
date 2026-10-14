@@ -859,8 +859,33 @@ def training_main(args) -> None:
         # (next) fine-tunes grid, decode MLP, and BsdfDecoder jointly
         # against the real BSDF loss. Only runs for the `ntc_grid` latents
         # path; the stock `dense` path is unaffected.
+        #
+        # `ntc_grid` configs set `latents.normalize: false`, unlike the
+        # stock default. They have to: this path runs direct optimization
+        # (`bsdf_finetuning > 0`), and `training_bsdf_diropt` asserts that
+        # normalization is off for exactly that reason. Stock RTNAM only ever
+        # pairs `normalize: true` with `bsdf_finetuning: 0`.
+        #
+        # Measured consequence of getting this wrong, since it is not obvious:
+        # with the squash on, the encoder's raw latents reach [-11.8, 14.5]
+        # (mean |z| = 5.37), so the squash runs deep in saturation and scales
+        # direct optimization's gradients by ~0.025, freezing the grid --
+        # -37.5 dB even with the latents correctly bounded to (-1, 1). See
+        # ntc_latent_texture.slang for the full variant table.
+        #
+        # The line below is therefore a no-op for a correct config, kept only
+        # so that a stale `normalize: true` config still reaches the assert's
+        # intent instead of tripping it.
+        job.config['model']['latents']['normalize'] = False
         training_ntc_warmstart(job)
     training_bsdf_diropt(job)
+    # rtcnam/QUANTIZATION_PLAN.md Milestone A: no-op unless
+    # `latents.ntc_grid.quantize.enabled` is set, so every existing config
+    # (dense or ntc_grid) is unaffected. `training_bsdf_decoder_repair()` is
+    # likewise already a no-op without `training.num_iterations.decoder_repair`
+    # configured -- it was defined but never called from here before this.
+    training_ntc_quantize(job)
+    training_bsdf_decoder_repair(job)
     training_sampler(job)
     training_aux(job)
 
@@ -1046,9 +1071,16 @@ def training_ntc_warmstart(job: TrainingJob) -> None:
         run_train_kernel=run_train_kernel,
     )
 
-    # Deliberately left as 'Training', not 'Done': `training_bsdf_diropt()`
-    # runs next and calls `neural_model.start_training(neural_model.latent_texture)`
-    # itself, which resets the status regardless.
+    # The grid now holds real values, so checkpoints from here on can render
+    # it (checkpoint.py skips the neural render while this is False -- see
+    # `NtcLatentTexture.ready_for_render`).
+    neural_model.latent_texture.instances[0].ready_for_render = True
+
+
+    # Status deliberately left as 'Training', not 'Done':
+    # `training_bsdf_diropt()` runs next and calls
+    # `neural_model.start_training(neural_model.latent_texture)` itself,
+    # which resets the status regardless.
 
 
 def training_bsdf_diropt(job: TrainingJob) -> None:
@@ -1113,7 +1145,25 @@ def training_bsdf_diropt(job: TrainingJob) -> None:
         [configured_batch_instance_scheduler.batch_sizes[-1]],
     )
 
-    neural_model.start_training(neural_model.decoder)
+    # rtcnam: optionally leave BsdfDecoder frozen through this phase, so it
+    # keeps exactly the function `BsdfEncoding` gave it and only the latent
+    # representation adapts. Default False preserves the stock behavior
+    # (decoder retrained jointly) bit-for-bit.
+    #
+    # Why this exists: every `ntc_grid` run retrains the decoder here for
+    # 100k iterations, while the dense baseline that renders correctly uses
+    # `bsdf_finetuning: 0` and never retrains its decoder at all. Probed
+    # directly, BsdfEncoding's decoder is well-behaved off-manifold (mean
+    # luminance 0.032 over uniform-random angles, nothing above 100),
+    # whereas after grid finetuning it is not (mean 172-670, 1-7% above
+    # 100) -- which is what blows up indirect path-tracing bounces. Three
+    # different latent bounds were tried first and none fixed it, so the
+    # decoder's retraining, not the latent distribution, is the remaining
+    # suspect. See rtcnam/NTC_LATENT_TEXTURE_NOTES.md.
+    if not config['training'].get('freeze_decoder_during_diropt', False):
+        neural_model.start_training(neural_model.decoder)
+    else:
+        print('Freezing BsdfDecoder for this phase; optimizing the latent representation only.')
     neural_model.start_training(neural_model.latent_texture)
 
     assert neural_model.num_instances == 1, (
@@ -1140,6 +1190,18 @@ def training_bsdf_diropt(job: TrainingJob) -> None:
             'Warning: Deterministic optimization is likely to exceed available memory when using direct optimization of latent textures!'
         )
 
+    # rtcnam coverage penalty (see eval_diropt_model_and_loss, train.slang):
+    # discourages BsdfDecoder from developing out-of-distribution luminance
+    # spikes during this (possibly long) joint finetuning phase, which a
+    # path-traced render's indirect bounces -- unlike this training
+    # distribution -- can and do land on via the trained Sampler. Weight 0
+    # (the default; absent from every pre-existing config, including every
+    # dense-path one) makes the kernel's own default parameters apply,
+    # reproducing its exact prior behavior.
+    coverage_penalty = config['training'].get('coverage_penalty', {})
+    coverage_penalty_weight = coverage_penalty.get('weight', 0.0)
+    coverage_penalty_cap = coverage_penalty.get('cap', 0.0)
+
     train_bsdf_diropt = module.train_bsdf_diropt.as_func().map(
         latent_texture=(0,), decoder=(0,), sample=(0, 1), sg=(0, 1)
     )
@@ -1154,6 +1216,8 @@ def training_bsdf_diropt(job: TrainingJob) -> None:
             call_id=spy.call_id(),
             loss_buffer=phase_runtime.loss_buffer.tensor,
             loss_function=loss_function,
+            coverage_penalty_weight=coverage_penalty_weight,
+            coverage_penalty_cap=coverage_penalty_cap,
             _append_to=iteration_block.train_cmd,
         )
 
@@ -1168,6 +1232,65 @@ def training_bsdf_diropt(job: TrainingJob) -> None:
     # Mark neural model components as trained.
     neural_model.decoder.status = 'Done'
     neural_model.latent_texture.status = 'Done'
+
+
+def training_ntc_quantize(job: TrainingJob) -> None:
+    """Round an `NtcLatentTexture`'s grids to a fixed number of levels and
+    exclude them from further optimization.
+
+    rtcnam/QUANTIZATION_PLAN.md, Milestone A ("fast gate"): the cheap half of
+    4-bit latent quantization -- round once, freeze, let a short decoder-only
+    refinetune (`training_bsdf_decoder_repair()`, called right after this in
+    `training_main()`) absorb the rounding error. No dither, no new Slang
+    types; see `NtcLatentTexture.quantize_grids()`'s docstring for why.
+
+    Called right after `training_bsdf_diropt()`, by which point
+    `neural_model.latent_texture.status` is already `'Done'`. No pruning is
+    needed to keep the decoder repair phase that follows from touching the
+    now-frozen grids: `TrainingPhaseRuntime.__init__` (this file) builds a
+    brand new optimizer from scratch for every phase, initialized against
+    `neural_model.active_training_models()` at that moment -- which already
+    excludes anything not `'Training'`. There is no job-wide optimizer whose
+    tracked parameter set could grow stale across phases; confirmed by
+    reading `TrainingPhaseRuntime.__init__` and `TrainingJob` (no `optimizer`
+    attribute on the latter at all) rather than assumed.
+    """
+    neural_model = job.neural_model
+    config = job.config
+
+    quantize_config = config['model']['latents'].get('ntc_grid', {}).get('quantize', {})
+    if not quantize_config.get('enabled', False):
+        return
+
+    assert isinstance(neural_model.latent_texture.instances[0], NtcLatentTexture)
+    assert neural_model.latent_texture.status == 'Done', (
+        'training_ntc_quantize() must run after training_bsdf_diropt() leaves the '
+        'latent texture Done, so active_training_models() already excludes it.'
+    )
+
+    bits = quantize_config.get('bits', 4)
+    print(f'Quantizing NTC grids to {bits}-bit ({(1 << bits) - 1} levels)...')
+    stats = neural_model.latent_texture.instances[0].quantize_grids(bits)
+    for s in stats:
+        print(
+            f"  tile {s['tile_idx']:3d} {s['kind']:8s} "
+            f"range=[{s['min']:7.3f},{s['max']:6.3f}] step={s['step']:.5f} "
+            f"rms_error={s['rms_error']:.5f}"
+        )
+
+    # Effective packed size, independent of today's on-disk fp16 EXR format
+    # (QUANTIZATION_PLAN.md: "report first, change the file format second").
+    ntc = config['model']['latents']['ntc_grid']
+    high_res_bytes = 0
+    low_res_bytes = 0
+    for material in job.reference_materials:
+        res = material.texture_resolution
+        high_res = max(1, res // ntc['grid_size_scale'])
+        low_res = max(1, high_res // 2)
+        high_res_bytes += high_res * high_res * ntc['num_features'] * bits // 8
+        low_res_bytes += low_res * low_res * ntc['num_features'] * bits // 8
+    total_mb = (high_res_bytes + low_res_bytes) / 1e6
+    print(f'Effective packed grid size at {bits}-bit: {total_mb:.2f} MB (reporting only, not yet the on-disk format)')
 
 
 def training_bsdf_decoder_repair(job: TrainingJob) -> None:
@@ -1275,6 +1398,18 @@ def training_bsdf_decoder_repair(job: TrainingJob) -> None:
         TrainingTargets('bsdf'),
     )
 
+    # rtcnam: `train_bsdf_diropt` (train.slang) gained
+    # `coverage_penalty_weight`/`coverage_penalty_cap` parameters when
+    # `training_bsdf_diropt()` (above) added its coverage-penalty support;
+    # this function calls the same Slang entry point but predates that
+    # change and was never updated, since nothing called this function
+    # until `training_ntc_quantize()` started being used. Same defaulting
+    # as `training_bsdf_diropt()`: weight 0.0 reproduces the kernel's own
+    # prior behavior exactly (no existing config sets this here either).
+    coverage_penalty = config['training'].get('coverage_penalty', {})
+    coverage_penalty_weight = coverage_penalty.get('weight', 0.0)
+    coverage_penalty_cap = coverage_penalty.get('cap', 0.0)
+
     train_bsdf_diropt = module.train_bsdf_diropt.as_func().map(
         latent_texture=(0,), decoder=(0,), sample=(0, 1), sg=(0, 1)
     )
@@ -1289,6 +1424,8 @@ def training_bsdf_decoder_repair(job: TrainingJob) -> None:
             call_id=spy.call_id(),
             loss_buffer=phase_runtime.loss_buffer.tensor,
             loss_function=loss_function,
+            coverage_penalty_weight=coverage_penalty_weight,
+            coverage_penalty_cap=coverage_penalty_cap,
             _append_to=iteration_block.train_cmd,
         )
 

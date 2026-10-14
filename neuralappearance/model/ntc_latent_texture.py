@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,6 +16,84 @@ from .texture import Texture
 
 if TYPE_CHECKING:
     from datagen import ReferenceMaterials
+
+
+# Packed-4-bit grid checkpoint format: a self-describing binary file per
+# grid, written only once `NtcLatentTexture.quantized` is True (see
+# `quantize_grids()`). Self-describing (carries its own bits/range) rather
+# than relying on `model.json`'s `_params` because `NeuralModel.load_checkpoint()`
+# loads checkpoint images before checkpoint params (`neural_material_model.py`'s
+# `load_checkpoint()`), so this file can't assume range metadata is available
+# yet at image-load time.
+_QUANTIZED_GRID_MAGIC = b'NTC4'
+_QUANTIZED_GRID_VERSION = 1
+_QUANTIZED_GRID_HEADER = struct.Struct('<4sBBIIff')  # magic, version, bits, resolution, num_channels, lo, hi
+
+
+def _pack_quantized_grid(data: np.ndarray, lo: float, hi: float, bits: int) -> bytes:
+    """Pack an already-quantized grid (values at ``2**bits`` levels spanning
+    ``[lo, hi]``, as produced by ``quantize_grids()``) into a self-describing
+    binary blob: a fixed header followed by two 4-bit indices per byte.
+
+    Deliberately diverges from RTXNTC's literal on-disk layout (4 features
+    packed into one uint16 per grid cell): this packs 2 consecutive flat-
+    buffer values per byte instead. Same 4-bits/value storage cost and
+    resulting file size; the byte order only matters if something reads it
+    directly on the GPU, which this project defers (dequantize-at-load,
+    QUANTIZATION_PLAN.md Decision 3).
+    """
+    if not (1 <= bits <= 4):
+        # Packing below hardcodes one nibble (4 bits) per index -- a larger
+        # `bits` would silently truncate instead of raising, which is worse
+        # than refusing outright.
+        raise ValueError(f'Packed grid format only supports 1-4 bits, got {bits}.')
+
+    resolution = data.shape[0]
+    num_channels = data.shape[-1]
+    levels = (1 << bits) - 1
+    flat = data.astype(np.float32).ravel()
+
+    span = hi - lo
+    if span > 0.0:
+        indices = np.clip(np.round((flat - lo) / span * levels), 0, levels).astype(np.uint8)
+    else:
+        indices = np.zeros_like(flat, dtype=np.uint8)
+
+    if indices.size % 2 == 1:
+        indices = np.concatenate([indices, np.zeros(1, dtype=np.uint8)])
+    packed = (indices[0::2] & 0x0F) | ((indices[1::2] & 0x0F) << 4)
+
+    header = _QUANTIZED_GRID_HEADER.pack(
+        _QUANTIZED_GRID_MAGIC, _QUANTIZED_GRID_VERSION, bits, resolution, num_channels, lo, hi
+    )
+    return header + packed.astype(np.uint8).tobytes()
+
+
+def _unpack_quantized_grid(buf: bytes) -> tuple[int, int, int, float, float, np.ndarray]:
+    """Inverse of ``_pack_quantized_grid()``. Returns ``(bits, resolution,
+    num_channels, lo, hi, flat_values)`` where ``flat_values`` is a flat
+    float32 array of length ``resolution * resolution * num_channels``, in
+    the same order ``Texture.to_numpy()``/``from_numpy()`` already use."""
+    header = buf[: _QUANTIZED_GRID_HEADER.size]
+    magic, version, bits, resolution, num_channels, lo, hi = _QUANTIZED_GRID_HEADER.unpack(header)
+    if magic != _QUANTIZED_GRID_MAGIC:
+        raise ValueError(f'Not a packed quantized-grid file (bad magic {magic!r}).')
+    if version != _QUANTIZED_GRID_VERSION:
+        raise ValueError(f'Unsupported packed-grid version {version}.')
+
+    packed = np.frombuffer(buf, dtype=np.uint8, offset=_QUANTIZED_GRID_HEADER.size)
+    indices = np.empty(packed.size * 2, dtype=np.uint8)
+    indices[0::2] = packed & 0x0F
+    indices[1::2] = (packed >> 4) & 0x0F
+
+    n = resolution * resolution * num_channels
+    indices = indices[:n]
+    levels = (1 << bits) - 1
+    if levels > 0:
+        values = lo + indices.astype(np.float32) / levels * (hi - lo)
+    else:
+        values = np.full(n, lo, dtype=np.float32)
+    return bits, resolution, num_channels, float(lo), float(hi), values
 
 
 class NtcLatentTexture(IModel):
@@ -104,6 +183,31 @@ class NtcLatentTexture(IModel):
         self.material_texture_resolution: list[int] = []
         self.material_texture_wrap: list[bool] = []
 
+        # Until `training_ntc_warmstart()` runs, the grid is still at its
+        # zero init and the decode MLP is untrained, so this texture decodes
+        # to values `BsdfDecoder` was never trained for. Rendering that is
+        # not merely meaningless (see `generate_from_encoder` below) -- it
+        # hangs: those latents drive `BsdfDecoder` (ScaledSigmoid, scale
+        # 1e5) to extreme values, and the resulting importance weights are
+        # huge but finite, so they slip past the path tracer's isinf/isnan
+        # guard and stall its Russian-roulette termination indefinitely
+        # (observed: GPU pegged at 100% with the host idle on a fence, for
+        # 30+ minutes, at the BsdfEncoding end-of-phase checkpoint).
+        # `checkpoint.py` skips the neural render while this is False.
+        # Bounding the decoded latents hard enough to survive that render
+        # was tried first and is NOT a viable alternative: it saturates the
+        # representation and wrecks quality (see ntc_latent_texture.slang).
+        self.ready_for_render = False
+
+        # Set by `quantize_grids()`; drives `save_checkpoint_images()`'s
+        # choice of packed-binary vs plain-EXR grid format. `quantize_bits`
+        # and the two range lists are the per-grid metadata the packed
+        # format's header needs (`_pack_quantized_grid()`/`_unpack_quantized_grid()`).
+        self.quantized = False
+        self.quantize_bits: int | None = None
+        self.quantize_high_res_ranges: list[tuple[float, float]] = []
+        self.quantize_low_res_ranges: list[tuple[float, float]] = []
+
     def _grid_resolutions(self, material_id: int) -> tuple[int, int]:
         base = self.material_texture_resolution[material_id]
         high_res = max(1, base // self.grid_size_scale)
@@ -180,6 +284,82 @@ class NtcLatentTexture(IModel):
         for grid in self.high_res_grids + self.low_res_grids:
             grid.make_optimizable()
 
+    def quantize_grids(self, bits: int) -> list[dict]:
+        """4-bit (or ``bits``-bit) quantize every grid in place: round each
+        feature value to the nearest of ``2**bits`` evenly spaced levels
+        spanning that grid's own observed [min, max] range.
+
+        rtcnam/QUANTIZATION_PLAN.md, Milestone A ("fast gate"): a one-off,
+        training-unaware round -- no dither, no optimizer involvement, no
+        change to ``ntc_latent_texture.slang``'s sampling code at all. The
+        caller (`train.py`'s `training_ntc_quantize()`) is responsible for
+        then excluding these grids from the optimizer (they are already
+        ``status == 'Done'`` by the time this runs, post-diropt) and running
+        a short decoder-only refinetune so `BsdfDecoder` adapts to the
+        rounding error -- this method only rounds; it does not freeze or
+        retrain anything itself.
+
+        Unlike RTXNTC's own scheme (additive-dither QAT against a fixed
+        [0, 1] range, Milestone B in the same plan), this uses each grid's
+        *own* range rather than [0, 1] -- this implementation's grids are not
+        squashed to any fixed interval (see ntc_latent_texture.slang's long
+        comment on why no output bound is applied), so a fixed [0, 1] would
+        either clip real values or waste most of the 16 levels on an interval
+        the grid never uses. Levels still span the data, so the quantization
+        step comparison against Milestone B remains meaningful despite the
+        different range convention.
+
+        Returns one stats dict per grid (``tile_idx``, ``kind`` -- 'high_res'
+        or 'low_res' --, ``min``, ``max``, ``step``, ``rms_error``) for the
+        caller to log. Also sets ``self.quantized``/``self.quantize_bits``/
+        ``self.quantize_high_res_ranges``/``self.quantize_low_res_ranges``,
+        which ``save_checkpoint_images()`` reads to decide whether (and at
+        what range) to pack the grid on disk -- that's the only persistence
+        this method causes; the checkpoint *file* itself is untouched here
+        (see QUANTIZATION_PLAN.md's "report first, change the file format
+        second").
+        """
+        levels = (1 << bits) - 1  # e.g. 15 for 4 bits, matching RTXNTC's own step = 1/15
+        stats = []
+        high_res_ranges: list[tuple[float, float]] = [(0.0, 0.0)] * len(self.high_res_grids)
+        low_res_ranges: list[tuple[float, float]] = [(0.0, 0.0)] * len(self.low_res_grids)
+        for kind, grids, ranges_out in (
+            ('high_res', self.high_res_grids, high_res_ranges),
+            ('low_res', self.low_res_grids, low_res_ranges),
+        ):
+            for tile_idx, grid in enumerate(grids):
+                data = grid.to_numpy().astype(np.float32)
+                lo, hi = float(data.min()), float(data.max())
+                ranges_out[tile_idx] = (lo, hi)
+                span = hi - lo
+                if span <= 0.0:
+                    # Degenerate (constant) grid -- nothing to quantize, and
+                    # dividing by span below would be a divide-by-zero.
+                    stats.append(
+                        {'tile_idx': tile_idx, 'kind': kind, 'min': lo, 'max': hi, 'step': 0.0,
+                         'rms_error': 0.0}
+                    )
+                    continue
+                normalized = (data - lo) / span  # -> [0, 1]
+                quantized = np.round(normalized * levels) / levels
+                error = quantized * span - (data - lo)
+                rms_error = float(np.sqrt(np.mean(error * error)))
+                # Texture.from_numpy() writes straight into a 'half' buffer
+                # with no dtype conversion (see Texture.__init__'s own
+                # explicit dtype=np.float16 zero-fill) -- float32 here would
+                # silently misinterpret the bytes rather than convert them.
+                grid.from_numpy((quantized * span + lo).astype(np.float16))
+                stats.append(
+                    {'tile_idx': tile_idx, 'kind': kind, 'min': lo, 'max': hi,
+                     'step': span / levels, 'rms_error': rms_error}
+                )
+
+        self.quantized = True
+        self.quantize_bits = bits
+        self.quantize_high_res_ranges = high_res_ranges
+        self.quantize_low_res_ranges = low_res_ranges
+        return stats
+
     def children(self) -> list[IModel]:
         return [self.decoder]
 
@@ -215,14 +395,33 @@ class NtcLatentTexture(IModel):
             'decoder': self.decoder.get_this(),
         }
 
+    def _quantized_grid_path(self, desc: list[str], folder: Path) -> Path:
+        return folder / ('.'.join(desc) + '.bin')
+
+    def _save_grid(
+        self,
+        grid: Texture,
+        desc: list[str],
+        folder: Path,
+        quantize_range: tuple[float, float] | None,
+    ) -> tuple[list[str], str]:
+        if self.quantized:
+            assert quantize_range is not None
+            lo, hi = quantize_range
+            path = self._quantized_grid_path(desc, folder)
+            path.write_bytes(_pack_quantized_grid(grid.to_numpy(), lo, hi, self.quantize_bits))
+            return (desc, path.name)
+        else:
+            return grid.save_checkpoint_images(desc, folder)[0]
+
     def save_checkpoint_images(
         self,
         desc: list[str],
         folder: Path,
     ) -> list[tuple[list[str], str]]:
-        """Save grid textures as EXR files, plus the decoder's own image
-        state (its weight-visualization EXR) via the default children
-        traversal."""
+        """Save grid textures (packed 4-bit binary once ``self.quantized``,
+        plain EXR otherwise), plus the decoder's own image state (its
+        weight-visualization EXR) via the default children traversal."""
 
         out_files: list[tuple[list[str], str]] = super().save_checkpoint_images(desc, folder)
 
@@ -233,12 +432,14 @@ class NtcLatentTexture(IModel):
                 if self.has_udims[material_id]:
                     out_desc += [f'udim{udim_id}']
 
-                out_files += self.high_res_grids[tile_idx].save_checkpoint_images(
-                    [*out_desc, 'grid_high_res'], folder
-                )
-                out_files += self.low_res_grids[tile_idx].save_checkpoint_images(
-                    [*out_desc, 'grid_low_res'], folder
-                )
+                out_files.append(self._save_grid(
+                    self.high_res_grids[tile_idx], [*out_desc, 'grid_high_res'], folder,
+                    self.quantize_high_res_ranges[tile_idx] if self.quantized else None,
+                ))
+                out_files.append(self._save_grid(
+                    self.low_res_grids[tile_idx], [*out_desc, 'grid_low_res'], folder,
+                    self.quantize_low_res_ranges[tile_idx] if self.quantized else None,
+                ))
                 tile_idx += 1
 
         return out_files
@@ -250,7 +451,12 @@ class NtcLatentTexture(IModel):
     ):
         super().load_checkpoint_images(desc, folder)
 
-        load_items: list[tuple[Texture, Path]] = []
+        exr_load_items: list[tuple[Texture, Path]] = []
+        high_res_ranges: list[tuple[float, float]] = [(0.0, 0.0)] * len(self.high_res_grids)
+        low_res_ranges: list[tuple[float, float]] = [(0.0, 0.0)] * len(self.low_res_grids)
+        quantized_any = False
+        bits_seen: int | None = None
+
         tile_idx = 0
         for material_id in self.material_ids:
             for udim_id in self.udim_mapping[material_id]:
@@ -258,12 +464,41 @@ class NtcLatentTexture(IModel):
                 if self.has_udims[material_id]:
                     out_desc += [f'udim{udim_id}']
 
-                hi = self.high_res_grids[tile_idx]
-                lo = self.low_res_grids[tile_idx]
-                load_items.append((hi, hi.checkpoint_image_path([*out_desc, 'grid_high_res'], folder)))
-                load_items.append((lo, lo.checkpoint_image_path([*out_desc, 'grid_low_res'], folder)))
+                for grid, kind, ranges_out in (
+                    (self.high_res_grids[tile_idx], 'grid_high_res', high_res_ranges),
+                    (self.low_res_grids[tile_idx], 'grid_low_res', low_res_ranges),
+                ):
+                    grid_desc = [*out_desc, kind]
+                    bin_path = self._quantized_grid_path(grid_desc, folder)
+                    if bin_path.is_file():
+                        bits, resolution, num_channels, lo, hi, values = _unpack_quantized_grid(
+                            bin_path.read_bytes()
+                        )
+                        assert resolution == grid.resolution and num_channels == grid.num_channels, (
+                            f'Packed grid shape mismatch at {bin_path}: file has '
+                            f'resolution={resolution} num_channels={num_channels}, expected '
+                            f'resolution={grid.resolution} num_channels={grid.num_channels}.'
+                        )
+                        grid.from_numpy(values.astype(np.float16))
+                        ranges_out[tile_idx] = (lo, hi)
+                        quantized_any = True
+                        bits_seen = bits
+                    else:
+                        exr_load_items.append((grid, grid.checkpoint_image_path(grid_desc, folder)))
+
                 tile_idx += 1
 
-        bitmaps = spy.Bitmap.read_multiple([path for _, path in load_items])
-        for (tex, _), bitmap in zip(load_items, bitmaps, strict=True):
-            tex.load_from_bitmap(bitmap)
+        if exr_load_items:
+            bitmaps = spy.Bitmap.read_multiple([path for _, path in exr_load_items])
+            for (tex, _), bitmap in zip(exr_load_items, bitmaps, strict=True):
+                tex.load_from_bitmap(bitmap)
+
+        self.quantized = quantized_any
+        self.quantize_bits = bits_seen
+        self.quantize_high_res_ranges = high_res_ranges
+        self.quantize_low_res_ranges = low_res_ranges
+
+        # A checkpoint on disk holds real trained grid values, so anything
+        # loading one (the visualizer, render_headless, a repeat training
+        # job) can render it.
+        self.ready_for_render = True
