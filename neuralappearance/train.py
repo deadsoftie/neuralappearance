@@ -1291,22 +1291,27 @@ def training_ntc_quantize(job: TrainingJob) -> None:
     stats = neural_model.latent_texture.instances[0].quantize_grids(bits)
     for s in stats:
         print(
-            f"  tile {s['tile_idx']:3d} {s['kind']:8s} "
+            f"  tile {s['tile_idx']:3d} mip {s['mip_level']} {s['kind']:8s} "
             f"range=[{s['min']:7.3f},{s['max']:6.3f}] step={s['step']:.5f} "
             f"rms_error={s['rms_error']:.5f}"
         )
 
     # Effective packed size, independent of today's on-disk fp16 EXR format
     # (QUANTIZATION_PLAN.md: "report first, change the file format second").
+    # Sums every mip's grid pair (mirrors `NtcLatentTexture._grid_resolutions()`'s
+    # `base_resolution >> mip_level` downscale) -- a geometric series dominated
+    # by mip 0, so this is a no-op at `num_mip_levels == 1`.
     ntc = config['model']['latents']['ntc_grid']
+    num_mip_levels = config['model']['latents']['num_mip_levels']
     high_res_bytes = 0
     low_res_bytes = 0
     for material in job.reference_materials:
-        res = material.texture_resolution
-        high_res = max(1, res // ntc['grid_size_scale'])
-        low_res = max(1, high_res // 2)
-        high_res_bytes += high_res * high_res * ntc['num_features'] * bits // 8
-        low_res_bytes += low_res * low_res * ntc['num_features'] * bits // 8
+        for mip_level in range(num_mip_levels):
+            res = max(1, material.texture_resolution >> mip_level)
+            high_res = max(1, res // ntc['grid_size_scale'])
+            low_res = max(1, high_res // 2)
+            high_res_bytes += high_res * high_res * ntc['num_features'] * bits // 8
+            low_res_bytes += low_res * low_res * ntc['num_features'] * bits // 8
     total_mb = (high_res_bytes + low_res_bytes) / 1e6
     print(f'Effective packed grid size at {bits}-bit: {total_mb:.2f} MB (reporting only, not yet the on-disk format)')
 

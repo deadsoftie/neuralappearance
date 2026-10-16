@@ -327,9 +327,10 @@ class NtcLatentTexture(IModel):
         step comparison against Milestone B remains meaningful despite the
         different range convention.
 
-        Returns one stats dict per grid (``tile_idx``, ``kind`` -- 'high_res'
-        or 'low_res' --, ``min``, ``max``, ``step``, ``rms_error``) for the
-        caller to log. Also sets ``self.quantized``/``self.quantize_bits``/
+        Returns one stats dict per grid (``tile_idx``, ``mip_level``,
+        ``kind`` -- 'high_res' or 'low_res' --, ``min``, ``max``, ``step``,
+        ``rms_error``) for the caller to log. Also sets
+        ``self.quantized``/``self.quantize_bits``/
         ``self.quantize_high_res_ranges``/``self.quantize_low_res_ranges``,
         which ``save_checkpoint_images()`` reads to decide whether (and at
         what range) to pack the grid on disk -- that's the only persistence
@@ -345,17 +346,21 @@ class NtcLatentTexture(IModel):
             ('high_res', self.high_res_grids, high_res_ranges),
             ('low_res', self.low_res_grids, low_res_ranges),
         ):
-            for tile_idx, grid in enumerate(grids):
+            for grid_idx, grid in enumerate(grids):
+                # `grids` is flattened as `tile_idx * num_mip_levels +
+                # mip_level` (see `model_init`) -- decode back to the pair
+                # callers actually want to log.
+                tile_idx, mip_level = divmod(grid_idx, self.num_mip_levels)
                 data = grid.to_numpy().astype(np.float32)
                 lo, hi = float(data.min()), float(data.max())
-                ranges_out[tile_idx] = (lo, hi)
+                ranges_out[grid_idx] = (lo, hi)
                 span = hi - lo
                 if span <= 0.0:
                     # Degenerate (constant) grid -- nothing to quantize, and
                     # dividing by span below would be a divide-by-zero.
                     stats.append(
-                        {'tile_idx': tile_idx, 'kind': kind, 'min': lo, 'max': hi, 'step': 0.0,
-                         'rms_error': 0.0}
+                        {'tile_idx': tile_idx, 'mip_level': mip_level, 'kind': kind,
+                         'min': lo, 'max': hi, 'step': 0.0, 'rms_error': 0.0}
                     )
                     continue
                 normalized = (data - lo) / span  # -> [0, 1]
@@ -368,8 +373,8 @@ class NtcLatentTexture(IModel):
                 # silently misinterpret the bytes rather than convert them.
                 grid.from_numpy((quantized * span + lo).astype(np.float16))
                 stats.append(
-                    {'tile_idx': tile_idx, 'kind': kind, 'min': lo, 'max': hi,
-                     'step': span / levels, 'rms_error': rms_error}
+                    {'tile_idx': tile_idx, 'mip_level': mip_level, 'kind': kind,
+                     'min': lo, 'max': hi, 'step': span / levels, 'rms_error': rms_error}
                 )
 
         self.quantized = True
@@ -450,14 +455,22 @@ class NtcLatentTexture(IModel):
                 if self.has_udims[material_id]:
                     out_desc += [f'udim{udim_id}']
 
-                out_files.append(self._save_grid(
-                    self.high_res_grids[tile_idx], [*out_desc, 'grid_high_res'], folder,
-                    self.quantize_high_res_ranges[tile_idx] if self.quantized else None,
-                ))
-                out_files.append(self._save_grid(
-                    self.low_res_grids[tile_idx], [*out_desc, 'grid_low_res'], folder,
-                    self.quantize_low_res_ranges[tile_idx] if self.quantized else None,
-                ))
+                for mip_level in range(self.num_mip_levels):
+                    grid_idx = tile_idx * self.num_mip_levels + mip_level
+                    # mip 0 keeps the exact filenames this format already
+                    # used before mips existed, so single-mip checkpoints
+                    # (every config in the repo today) stay byte-identical
+                    # on disk; mip > 0 is new, so it gets a new suffix.
+                    mip_desc = out_desc if mip_level == 0 else [*out_desc, f'mip{mip_level}']
+
+                    out_files.append(self._save_grid(
+                        self.high_res_grids[grid_idx], [*mip_desc, 'grid_high_res'], folder,
+                        self.quantize_high_res_ranges[grid_idx] if self.quantized else None,
+                    ))
+                    out_files.append(self._save_grid(
+                        self.low_res_grids[grid_idx], [*mip_desc, 'grid_low_res'], folder,
+                        self.quantize_low_res_ranges[grid_idx] if self.quantized else None,
+                    ))
                 tile_idx += 1
 
         return out_files
@@ -482,27 +495,32 @@ class NtcLatentTexture(IModel):
                 if self.has_udims[material_id]:
                     out_desc += [f'udim{udim_id}']
 
-                for grid, kind, ranges_out in (
-                    (self.high_res_grids[tile_idx], 'grid_high_res', high_res_ranges),
-                    (self.low_res_grids[tile_idx], 'grid_low_res', low_res_ranges),
-                ):
-                    grid_desc = [*out_desc, kind]
-                    bin_path = self._quantized_grid_path(grid_desc, folder)
-                    if bin_path.is_file():
-                        bits, resolution, num_channels, lo, hi, values = _unpack_quantized_grid(
-                            bin_path.read_bytes()
-                        )
-                        assert resolution == grid.resolution and num_channels == grid.num_channels, (
-                            f'Packed grid shape mismatch at {bin_path}: file has '
-                            f'resolution={resolution} num_channels={num_channels}, expected '
-                            f'resolution={grid.resolution} num_channels={grid.num_channels}.'
-                        )
-                        grid.from_numpy(values.astype(np.float16))
-                        ranges_out[tile_idx] = (lo, hi)
-                        quantized_any = True
-                        bits_seen = bits
-                    else:
-                        exr_load_items.append((grid, grid.checkpoint_image_path(grid_desc, folder)))
+                for mip_level in range(self.num_mip_levels):
+                    grid_idx = tile_idx * self.num_mip_levels + mip_level
+                    # Matches save_checkpoint_images(): mip 0 has no suffix.
+                    mip_desc = out_desc if mip_level == 0 else [*out_desc, f'mip{mip_level}']
+
+                    for grid, kind, ranges_out in (
+                        (self.high_res_grids[grid_idx], 'grid_high_res', high_res_ranges),
+                        (self.low_res_grids[grid_idx], 'grid_low_res', low_res_ranges),
+                    ):
+                        grid_desc = [*mip_desc, kind]
+                        bin_path = self._quantized_grid_path(grid_desc, folder)
+                        if bin_path.is_file():
+                            bits, resolution, num_channels, lo, hi, values = _unpack_quantized_grid(
+                                bin_path.read_bytes()
+                            )
+                            assert resolution == grid.resolution and num_channels == grid.num_channels, (
+                                f'Packed grid shape mismatch at {bin_path}: file has '
+                                f'resolution={resolution} num_channels={num_channels}, expected '
+                                f'resolution={grid.resolution} num_channels={grid.num_channels}.'
+                            )
+                            grid.from_numpy(values.astype(np.float16))
+                            ranges_out[grid_idx] = (lo, hi)
+                            quantized_any = True
+                            bits_seen = bits
+                        else:
+                            exr_load_items.append((grid, grid.checkpoint_image_path(grid_desc, folder)))
 
                 tile_idx += 1
 
