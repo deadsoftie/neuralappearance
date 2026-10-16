@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import slangpy as spy
-from neuralnetworks import IModel, Real, SlangType
+from neuralnetworks import IModel, Real, SlangType, WeightQuantization
 
 from .mlp import MLP
 from .texture import Texture
@@ -124,6 +124,7 @@ class NtcLatentTexture(IModel):
         decoder_hidden_layers: list[int],
         decoder_activation: str,
         optimizable: bool = True,
+        decoder_quantization: WeightQuantization | None = None,
     ) -> NtcLatentTexture:
         tex = cls(
             num_latents,
@@ -133,6 +134,7 @@ class NtcLatentTexture(IModel):
             decoder_hidden_layers,
             decoder_activation,
             optimizable,
+            decoder_quantization,
         )
 
         num_materials = max(reference_materials.ids) + 1
@@ -159,6 +161,7 @@ class NtcLatentTexture(IModel):
         decoder_hidden_layers: list[int],
         decoder_activation: str,
         optimizable: bool = True,
+        decoder_quantization: WeightQuantization | None = None,
     ):
         super().__init__()
 
@@ -173,6 +176,7 @@ class NtcLatentTexture(IModel):
         self.num_pos_enc_waves = num_pos_enc_waves
         self.decoder_hidden_layers = decoder_hidden_layers
         self.decoder_activation = decoder_activation
+        self.decoder_quantization = decoder_quantization
         self.optimizable = optimizable
 
         self.num_tiles = 0
@@ -254,6 +258,7 @@ class NtcLatentTexture(IModel):
             num_outputs=self.num_latents,
             hidden_layers=self.decoder_hidden_layers,
             hidden_activations=self.decoder_activation,
+            quantization=self.decoder_quantization,
         )
         self.decoder.set_parent(self)
         self.decoder.initialize(module, f'float[{decoder_input_width}]')

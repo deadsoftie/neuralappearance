@@ -1083,6 +1083,35 @@ def training_ntc_warmstart(job: TrainingJob) -> None:
     # which resets the status regardless.
 
 
+def _diropt_regularizer_params(config: dict) -> dict:
+    """Read `train_bsdf_diropt`'s optional regularizer knobs (see
+    eval_diropt_model_and_loss, train.slang) -- shared by
+    training_bsdf_diropt() and training_bsdf_decoder_repair() (the latter
+    predates coverage_penalty/latent_smoothness and calls the same Slang
+    entry point). Weight 0 (the default; absent from every pre-existing
+    config) is an exact no-op for both.
+
+    coverage_penalty: discourages BsdfDecoder from developing out-of-
+    distribution luminance spikes at (wi, wo) pairs outside the training
+    distribution.
+
+    latent_smoothness: penalizes the grid+its own decode MLP for moving
+    the decoded latent too far over one fixed physical UV step,
+    independent of (wi, wo) -- rtcnam/harness/aliasing_probe.py's fixed-
+    step probe is why this is the axis the sweep's non-1.11bpp blowups
+    actually live on, not (wi, wo) coverage (coverage_penalty was tried
+    first and confirmed, by a real retrain, to do nothing against this).
+    """
+    coverage_penalty = config['training'].get('coverage_penalty', {})
+    latent_smoothness = config['training'].get('latent_smoothness', {})
+    return {
+        'coverage_penalty_weight': coverage_penalty.get('weight', 0.0),
+        'coverage_penalty_cap': coverage_penalty.get('cap', 0.0),
+        'latent_smoothness_weight': latent_smoothness.get('weight', 0.0),
+        'latent_smoothness_eps': latent_smoothness.get('eps', 1.0 / 4096.0),
+    }
+
+
 def training_bsdf_diropt(job: TrainingJob) -> None:
     """Train latent texels and the BSDF decoder without an encoder in the path.
 
@@ -1190,17 +1219,7 @@ def training_bsdf_diropt(job: TrainingJob) -> None:
             'Warning: Deterministic optimization is likely to exceed available memory when using direct optimization of latent textures!'
         )
 
-    # rtcnam coverage penalty (see eval_diropt_model_and_loss, train.slang):
-    # discourages BsdfDecoder from developing out-of-distribution luminance
-    # spikes during this (possibly long) joint finetuning phase, which a
-    # path-traced render's indirect bounces -- unlike this training
-    # distribution -- can and do land on via the trained Sampler. Weight 0
-    # (the default; absent from every pre-existing config, including every
-    # dense-path one) makes the kernel's own default parameters apply,
-    # reproducing its exact prior behavior.
-    coverage_penalty = config['training'].get('coverage_penalty', {})
-    coverage_penalty_weight = coverage_penalty.get('weight', 0.0)
-    coverage_penalty_cap = coverage_penalty.get('cap', 0.0)
+    regularizer_params = _diropt_regularizer_params(config)
 
     train_bsdf_diropt = module.train_bsdf_diropt.as_func().map(
         latent_texture=(0,), decoder=(0,), sample=(0, 1), sg=(0, 1)
@@ -1216,8 +1235,7 @@ def training_bsdf_diropt(job: TrainingJob) -> None:
             call_id=spy.call_id(),
             loss_buffer=phase_runtime.loss_buffer.tensor,
             loss_function=loss_function,
-            coverage_penalty_weight=coverage_penalty_weight,
-            coverage_penalty_cap=coverage_penalty_cap,
+            **regularizer_params,
             _append_to=iteration_block.train_cmd,
         )
 
@@ -1398,17 +1416,14 @@ def training_bsdf_decoder_repair(job: TrainingJob) -> None:
         TrainingTargets('bsdf'),
     )
 
-    # rtcnam: `train_bsdf_diropt` (train.slang) gained
-    # `coverage_penalty_weight`/`coverage_penalty_cap` parameters when
-    # `training_bsdf_diropt()` (above) added its coverage-penalty support;
-    # this function calls the same Slang entry point but predates that
-    # change and was never updated, since nothing called this function
+    # rtcnam: `train_bsdf_diropt` (train.slang) gained its regularizer
+    # params when `training_bsdf_diropt()` (above) added coverage-penalty
+    # support; this function calls the same Slang entry point but predates
+    # that change and was never updated, since nothing called this function
     # until `training_ntc_quantize()` started being used. Same defaulting
-    # as `training_bsdf_diropt()`: weight 0.0 reproduces the kernel's own
-    # prior behavior exactly (no existing config sets this here either).
-    coverage_penalty = config['training'].get('coverage_penalty', {})
-    coverage_penalty_weight = coverage_penalty.get('weight', 0.0)
-    coverage_penalty_cap = coverage_penalty.get('cap', 0.0)
+    # as `training_bsdf_diropt()` (see _diropt_regularizer_params): weight
+    # 0.0 reproduces the kernel's own prior behavior exactly.
+    regularizer_params = _diropt_regularizer_params(config)
 
     train_bsdf_diropt = module.train_bsdf_diropt.as_func().map(
         latent_texture=(0,), decoder=(0,), sample=(0, 1), sg=(0, 1)
@@ -1424,8 +1439,7 @@ def training_bsdf_decoder_repair(job: TrainingJob) -> None:
             call_id=spy.call_id(),
             loss_buffer=phase_runtime.loss_buffer.tensor,
             loss_function=loss_function,
-            coverage_penalty_weight=coverage_penalty_weight,
-            coverage_penalty_cap=coverage_penalty_cap,
+            **regularizer_params,
             _append_to=iteration_block.train_cmd,
         )
 

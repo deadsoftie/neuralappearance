@@ -122,3 +122,20 @@ class ScaledSigmoid(Activation):
 
     def model_data(self):
         return {'scale': self.scale}
+
+
+class HardClamp(Activation):
+    """rtcnam: no-parameter safety-net clamp to [0, cap], meant to be
+    appended after another output_activation (e.g. ScaledSigmoid) -- see
+    hard_clamp.slang. Has no learnable weights, so it can be appended to an
+    already-trained checkpoint's decoder chain without retraining.
+    """
+
+    def __init__(
+        self, cap: float, width: AutoSettable[int] = Auto, dtype: AutoSettable[Real] = Auto
+    ):
+        super().__init__('HardClamp', width, dtype)
+        self.cap = cap
+
+    def model_data(self):
+        return {'cap': self.cap}

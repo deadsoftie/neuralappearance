@@ -50,6 +50,7 @@ class NeuralMaterial(f2.Material):
             source = source_path.read_text()
             source += generated_source
             source = source.replace('<HASH>', self.module_hash)
+            source = source.replace('<NUM_LATENTS>', str(neural_model.latent_texture.num_channels))
 
             self.module = device.load_module_from_source(
                 f'neural_material_{self.module_hash}',
@@ -91,12 +92,21 @@ class NeuralMaterial(f2.Material):
         else:
             aux_type = f'DummyAuxDecoder<{latents.num_channels}, 1>'
 
+        # rtcnam: None (every pre-existing checkpoint) substitutes a huge
+        # sentinel so `min(weight, sampler_weight_cap)` in
+        # neural_material.slang's sample() is a true no-op, same convention
+        # as every other opt-in rtcnam knob in this project.
+        sampler_weight_cap = neural_model.sampler_weight_cap
+        if sampler_weight_cap is None:
+            sampler_weight_cap = 3.402823e38
+
         return _NEURAL_MATERIAL_CONFIG_TEMPLATE.format(
             latents_type=latents.type_name,
             decoder_type=decoder.type_name,
             sampler_type=sampler_type,
             aux_type=aux_type,
             num_mip_levels=neural_model.num_mip_levels,
+            sampler_weight_cap=sampler_weight_cap,
         )
 
     def _write_config_buffer(
@@ -130,6 +140,7 @@ public typealias AuxDecoder_<HASH> = {aux_type};
 public struct NeuralMaterialConfig_<HASH>
 {{
     static const int num_mip_levels = {num_mip_levels};
+    static const float sampler_weight_cap = {sampler_weight_cap};
     public LatentTexture_<HASH> latents;
     public Decoder_<HASH> decoder;
     public Sampler_<HASH> sampler;

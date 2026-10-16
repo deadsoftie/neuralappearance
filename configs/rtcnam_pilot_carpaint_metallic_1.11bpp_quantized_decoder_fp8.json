@@ -1,0 +1,175 @@
+{
+    // rtcnam pilot (rtcnam/PLAN.md): carpaint_metallic, NTC LatentShape
+    // {gridSizeScale 6, numFeatures 8} == ntc-cli's 1.11 bpp preset.
+    // Identical to rtcnam_pilot_carpaint_metallic_1.11bpp_quantized.json
+    // (the validated Milestone A grid-quantization baseline, +32.19dB)
+    // except for model.latents.ntc_grid.decoder_quantization below -- the
+    // new axis, decoder MLP weight quantization. Kept as its own file
+    // rather than editing the baseline config in place, since that file is
+    // the permanent record of what produced the already-validated result.
+    "reference_materials": [
+        {
+            "type": "mdl",
+            "path": "vMaterials_2/Paint/Carpaint/Carpaint_Metallic.mdl",
+            "material": "Carpaint_Metallic"
+        }
+    ],
+
+    "training": {
+        "num_iterations": {
+            "bsdf": 100000,
+            "bsdf_finetuning": 100000,
+            // rtcnam/QUANTIZATION_PLAN.md Milestone A: short decoder-only
+            // refinetune after the grid is rounded+frozen
+            // (training_ntc_quantize(), called right before
+            // training_bsdf_decoder_repair() in training_main()). Same
+            // order-of-magnitude as warmstart_iterations below, not the
+            // full 100k bsdf_finetuning -- this only has to absorb a
+            // one-time rounding error, not fit the material from scratch.
+            "decoder_repair": 20000,
+            "sampler": 50000,
+            "aux": 50000
+        },
+        "deterministic": true,
+        "optimizer": {
+            "learning_rate": 0.001,
+            "cosine_annealing_scale": 0.01,
+            "gradient_scale": 128.0,
+            "hyperparams": {
+                "beta1": 0.9,
+                "beta2": 0.999,
+                "epsilon": 1e-07,
+                "l2_regularization": 0.0,
+                "ignore_invalid_gradients": true
+            }
+        },
+        "instance_schedule": [64, 16, 4, 1],
+        "loss_function": {
+            "type": "L1WithPowerLog",
+            "power": 3.0,
+            "epsilon": 1e-4
+        },
+        // rtcnam coverage penalty -- DISABLED, see the baseline config and
+        // rtcnam/NTC_LATENT_TEXTURE_NOTES.md for why.
+        "coverage_penalty": {
+            "weight": 0.0,
+            "cap": 5.0,
+            "samples": 8
+        },
+        "freeze_decoder_during_diropt": false
+    },
+
+    "model": {
+        "seed": 0,
+        "latents": {
+            "type": "ntc_grid",
+            "num_mip_levels": 1,
+            "num_channels": 8,
+            "normalize": false,
+            "ntc_grid": {
+                "grid_size_scale": 6,
+                "num_features": 8,
+                "num_pos_enc_waves": 3,
+                "decoder_hidden_layers": [64, 48, 32],
+                "decoder_activation": "HardGELU",
+                "warmstart_iterations": 20000,
+                // rtcnam/QUANTIZATION_PLAN.md Milestone A: round each grid
+                // to 2^bits - 1 levels over its own observed range once
+                // training_bsdf_diropt() finishes, then exclude it from the
+                // optimizer (see training_ntc_quantize() in train.py) --
+                // no dither, no new Slang types, see that function's and
+                // NtcLatentTexture.quantize_grids()'s docstrings for why.
+                "quantize": {
+                    "enabled": true,
+                    "bits": 4
+                },
+                // NEGATIVE RESULT, kept for reproducibility -- see
+                // rtcnam/DECODER_QUANTIZATION.md. This config is the exact
+                // one that produced those numbers (robust PSNR +31.61 ->
+                // +21.15 dB vs. the grid-only Milestone A baseline); it is
+                // not the recommended path. Decision: reverted to FP16
+                // (decoder_quantization disabled) everywhere else in this
+                // project. Left enabled here, unchanged, so this file stays
+                // the honest record of the experiment rather than a copy
+                // that no longer reproduces the documented result.
+                "decoder_quantization": {
+                    "enabled": true,
+                    "format": "FloatE4M3"
+                }
+            }
+        },
+        "encoder": {
+            "hidden_layers": [64, 64, 64],
+            "hidden_activations": "LeakyReLU"
+        },
+        "decoder": {
+            "hidden_layers": [16, 16],
+            "hidden_activations": "SmeLU",
+            "output_activation": {
+                "type": "ScaledSigmoid",
+                "scale": 1e5
+            },
+            "half_diff_parameterization": "StableRusinkiewicz",
+            "num_shading_frames": 2,
+            "direction_inputs": "WhWdZiZo"
+        },
+        "sampler": {
+            "num_specular_lobes": 1,
+            "hidden_layers": [16, 16],
+            "hidden_activations": "LeakyReLU"
+        },
+        "aux": {
+            "targets": "ref_diffuse_specular_roughness_normal",
+            "hidden_layers": [16, 16],
+            "hidden_activations": "SmeLU"
+        }
+    },
+
+    "data_generation": {
+        "seed": 0,
+        "batch_size_schedule": ["1k", "4k", "16k", "64k"],
+        "num_batches_per_generation": 64,
+        "share_data_between_instances": true,
+        "directional_sampling_strategy": "Balanced_UniformRusinkiewicz_UniformWiImportanceWo",
+        "balanced_directional_sampling_ratio": 0.95,
+        "color_augmentation": {
+            "enabled": true,
+            "num_iterations": 100000,
+            "start_ratio": 1.0,
+            "end_ratio": 0.0
+        },
+        "lod": {
+            "num_prefilter_samples": 64,
+            "num_prefilter_samples_reference": 256
+        }
+    },
+
+    "checkpoints": {
+        "period": -1,
+        "phases": ["BsdfEncoding", "BsdfDirectOptimization", "Sampler", "Aux"],
+        "rendering": {
+            "spp": 16,
+            "max_depth": 10,
+            "save_reference": true,
+            "save_neural": true,
+            "all_udims": false,
+            "format": "exr"
+        },
+        "bsdf_plots": {
+            "save": true,
+            "num_uvs": 5,
+            "num_samples": 1000,
+            "axes": ["log"],
+            "resolution": 450,
+            "udim_id": -1
+        },
+        "model": {
+            "save_images": true,
+            "save_params": true
+        },
+        "loss_plots": {
+            "save": true
+        },
+        "validation_losses": false
+    }
+}

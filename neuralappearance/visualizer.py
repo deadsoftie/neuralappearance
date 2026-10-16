@@ -12,7 +12,7 @@ import numpy as np
 import slangpy as spy
 from datagen import ReferenceMaterials, create_aux_data_generator
 from falcor2.editor.camera_controller import CameraController
-from model import NeuralModel, NeuralModelCheckpoint
+from model import NeuralModel, NeuralModelCheckpoint, NtcLatentTexture
 from neuralnetworks import utils as nn_utils
 from rendering.hybrid.hybrid_pathtracer import HybridPathTracer
 from rendering.hybrid.resample_helper import ResampleHelper
@@ -102,6 +102,19 @@ def _latent_texture_device_bytes(
     the on-disk checkpoint EXR, the live buffer size can't drift from what's
     really resident on the device).
     """
+    if isinstance(latent_texture, NtcLatentTexture):
+        # ntc_grid has no latent mips of its own -- one fixed-resolution
+        # high-res/low-res grid pair per tile regardless of num_mip_levels
+        # (a color-texture concept; see rtcnam/NTC_LATENT_TEXTURE_NOTES.md).
+        # Same tile_idx lookup as LatentTexture._texture_idx, just without a
+        # mip_level term.
+        udim_stride = 100
+        udim_idx = udim_id - 1001
+        tile_idx = latent_texture.tile_indirection[material_id * udim_stride + udim_idx]
+        hi = latent_texture.high_res_grids[tile_idx]
+        lo = latent_texture.low_res_grids[tile_idx]
+        return hi.buffer.storage.memory_usage.device + lo.buffer.storage.memory_usage.device
+
     total = 0
     found_any = False
     for mip_level in range(max(1, num_mip_levels)):

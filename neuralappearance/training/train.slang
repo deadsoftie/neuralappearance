@@ -91,7 +91,12 @@ void train_bsdf_diropt<
     // prior behavior bit-for-bit -- the extra term is `0 * (...)^2 = 0`,
     // added to a float, so it is a true no-op, not just "small".
     float coverage_penalty_weight = 0.f,
-    float coverage_penalty_cap = 0.f
+    float coverage_penalty_cap = 0.f,
+    // rtcnam: optional latent-smoothness regularizer (see
+    // eval_diropt_model_and_loss below). weight=0 (every existing config)
+    // is a true no-op, same convention as coverage_penalty above.
+    float latent_smoothness_weight = 0.f,
+    float latent_smoothness_eps = 0.f
 )
 {
     NeuralConfig::set_batch_index(call_id.x);
@@ -113,6 +118,8 @@ void train_bsdf_diropt<
         loss_function,
         coverage_penalty_weight,
         coverage_penalty_cap,
+        latent_smoothness_weight,
+        latent_smoothness_eps,
         loss_scale
     );
 }
@@ -133,7 +140,9 @@ float eval_diropt_model_and_loss<
     inout UniformSampleGenerator sg,
     LossFunction loss_function,
     no_diff float coverage_penalty_weight,
-    no_diff float coverage_penalty_cap
+    no_diff float coverage_penalty_cap,
+    no_diff float latent_smoothness_weight,
+    no_diff float latent_smoothness_eps
 )
 {
     float[NumLatents] latents = latent_texture.get_nearest({ sample.material_id, sample.mip_level, sample.uv });
@@ -195,6 +204,39 @@ float eval_diropt_model_and_loss<
             + 0.0722f * coverage_prediction[2];
         float excess = max(0.f, luminance - coverage_penalty_cap);
         loss += coverage_penalty_weight * excess * excess;
+    }
+
+    // rtcnam latent-smoothness penalty. Diagnosed via
+    // rtcnam/harness/aliasing_probe.py's fixed-UV-distance probe: at
+    // grid_size_scale values other than the one validated preset (6), the
+    // grid resolves real spatial detail finer presets can't -- stepping
+    // the SAME fixed physical UV distance (one color texel) moved the
+    // decoded latent ~6x further than at the validated preset (median
+    // |delta latent| 1.235 vs 0.196, same material, same step).
+    // `BsdfDecoder` is the identical fixed-size MLP at every preset, so a
+    // locally sharper latent field is a decoder-capacity mismatch, not a
+    // (wi, wo)-coverage gap -- `coverage_penalty` above was confirmed (by
+    // a real retrain) to do nothing against this, because it regularizes
+    // the wrong axis. This instead directly penalizes the grid+its own
+    // decode MLP for moving the latent too far over one color texel's
+    // width, independent of wi/wo: evaluate the SAME (differentiable)
+    // latent_texture at `sample.uv` offset by `latent_smoothness_eps` and
+    // penalize the squared latent-space distance. Zero weight (the
+    // default, every existing config) is an exact no-op below.
+    if (latent_smoothness_weight > 0.f)
+    {
+        float2 shifted_uv = sample.uv + float2(latent_smoothness_eps, 0.f);
+        float[NumLatents] latents_shifted = latent_texture.get_nearest({
+            sample.material_id, sample.mip_level, shifted_uv
+        });
+        float smoothness_loss = 0.f;
+        [ForceUnroll]
+        for (int i = 0; i < NumLatents; ++i)
+        {
+            float d = latents_shifted[i] - latents[i];
+            smoothness_loss += d * d;
+        }
+        loss += latent_smoothness_weight * smoothness_loss;
     }
 
     return loss;

@@ -92,6 +92,16 @@ class NeuralModelCheckpoint:
     encoder: Encoder | None
     sampler: Sampler | None
     aux: AuxDecoder | None
+    # rtcnam: optional hard cap on the indirect-bounce importance weight
+    # (bsdf / sampler pdf) computed in NeuralMaterialInstance_<HASH>.sample()
+    # (rendering/neural_material.slang). None (every pre-existing config)
+    # substitutes a sentinel "effectively infinite" constant in the
+    # generated Slang source -- see rendering/neural_material.py -- an
+    # exact no-op. Complements model.decoder.output_clamp (bsdf.py):
+    # that bounds the numerator, this bounds the full ratio, since a
+    # capped bsdf divided by a near-zero trained-Sampler pdf can still
+    # explode and compound multiplicatively over path-trace bounces.
+    sampler_weight_cap: float | None = None
 
     def components(self) -> list[tuple[str, nn.IModel | None]]:
         return [
@@ -157,6 +167,12 @@ class NeuralModel:
                     'implemented -- see rtcnam/PLAN.md, "Risks").'
                 )
             ntc_config = latents_config['ntc_grid']
+            decoder_quant_config = ntc_config.get('decoder_quantization', {})
+            decoder_quantization = (
+                nn.WeightQuantization[decoder_quant_config['format']]
+                if decoder_quant_config.get('enabled', False)
+                else None
+            )
             latent_texture = NtcLatentTexture.from_reference_materials(
                 reference_materials,
                 latents_config['num_channels'],
@@ -166,6 +182,7 @@ class NeuralModel:
                 ntc_config['decoder_hidden_layers'],
                 ntc_config.get('decoder_activation', 'HardGELU'),
                 optimizable=False,
+                decoder_quantization=decoder_quantization,
             )
         else:
             raise ValueError(f'Unknown model.latents.type: {latents_type!r}')
@@ -339,7 +356,10 @@ class NeuralModel:
                 ckpt_c = c.checkpoint_instance(best_instance_index)
             checkpoint_components.append(ckpt_c)
 
-        return NeuralModelCheckpoint(self.num_mip_levels, *checkpoint_components)
+        sampler_weight_cap = (self.config['model'].get('sampler') or {}).get('weight_cap')
+        return NeuralModelCheckpoint(
+            self.num_mip_levels, *checkpoint_components, sampler_weight_cap=sampler_weight_cap
+        )
 
     def prune_instances(
         self, num_instances_to_keep: int, instance_losses: np.ndarray

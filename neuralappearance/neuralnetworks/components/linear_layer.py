@@ -225,6 +225,11 @@ class LinearLayer(IModel):
                 self.model_error(
                     f'Quantization {self.quantization} is only supported for layers in half precision'
                 )
+            if Feature.float8 not in module.device.features:
+                self.model_error(
+                    f'Quantization {self.quantization} requires the device to support '
+                    'FP8 CoopVec (Feature.float8), which this device does not expose.'
+                )
 
         # Initialize weights with the Xavier uniform distribution.
         fan_in = self.num_inputs

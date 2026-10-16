@@ -74,6 +74,18 @@ class BsdfDecoder(nn.ModelChain):
         if output_activation is not None:
             modules += [output_activation]
 
+        # rtcnam: optional hard safety-net clamp appended after
+        # output_activation. No learnable parameters, so it's safe to add
+        # to an already-trained checkpoint's decoder chain without
+        # retraining -- see neuralnetworks/components/hard_clamp.slang and
+        # rtcnam/harness/bsdf_blowup_probe.py for why this exists (training-
+        # time fixes alone -- coverage_penalty, latent_smoothness -- did
+        # not eliminate the render-level damage). Absent from every
+        # pre-existing config, so this is an exact no-op unless opted in.
+        output_clamp = decoder_config.get('output_clamp')
+        if output_clamp is not None:
+            modules += [nn.HardClamp(cap=output_clamp)]
+
         super().__init__(*modules)
 
     def child_name(self, child: nn.IModel) -> str | None:

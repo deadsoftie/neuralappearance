@@ -19,13 +19,25 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
     int mip_level = 0;
     float texel_sample = 0.f;
     uint64_t config_handle = 0xFFFFFFFFFFFFFFFFull;
+    // Decoded once per shading-point visit by setup_material_instance()
+    // below and reused by eval/sample/eval_pdf, instead of each of them
+    // independently re-running the latent fetch (a cheap buffer read for
+    // the dense path, but a full grid-sample + decode-MLP forward pass
+    // for NtcLatentTexture -- see rtcnam/results/README.md's "Render-time
+    // cost" section). Safe because material_id/mip_level/texel_sample/
+    // si.uv are already identical across all three calls for one hit.
+    float[<NUM_LATENTS>] cached_latents;
 
-    __init(int material_id, int mip_level, float texel_sample, uint64_t config_handle)
+    __init(
+        int material_id, int mip_level, float texel_sample, uint64_t config_handle,
+        float[<NUM_LATENTS>] cached_latents
+    )
     {
         this.material_id = material_id;
         this.mip_level = mip_level;
         this.texel_sample = texel_sample;
         this.config_handle = config_handle;
+        this.cached_latents = cached_latents;
     }
 
     NeuralMaterialConfig_<HASH> get_config()
@@ -42,7 +54,7 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
             return float3(0.f);
 
         let config = get_config();
-        let latents = config.latents.get_bilinear_stochastic({ material_id, mip_level, si.uv }, texel_sample);
+        let latents = this.cached_latents;
         let result = config.decoder.forward({ material_id, mip_level, latents, wi, wo });
         var f = float3(result[0], result[1], result[2]);
         f = max(f, float3(0.f));
@@ -60,7 +72,7 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
             return false;
 
         let config = get_config();
-        let latents = config.latents.get_bilinear_stochastic({ material_id, mip_level, si.uv }, texel_sample);
+        let latents = this.cached_latents;
         let params = config.sampler.decode_params({ latents, wi });
 
         float3 wo = config.sampler.sample(wi, next_float3(sg), params);
@@ -72,6 +84,18 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
         result.weight = eval(si, result.wo_ws, sg) / result.pdf;
         if (any(isinf(result.weight)) || any(isnan(result.weight)))
             return false;
+
+        // rtcnam: firefly clamp on the indirect-bounce importance weight.
+        // model.decoder.output_clamp (bsdf_decoder.py) bounds `eval()`'s
+        // numerator; this bounds the full ratio, since a capped bsdf
+        // divided by a near-zero trained-Sampler pdf can still explode and
+        // compound multiplicatively over path-trace bounces -- confirmed
+        // directly: output_clamp alone left the render's max pixel value
+        // at ~9e15 despite every single BSDF evaluation being bounded to
+        // 100 (rtcnam/harness/bsdf_blowup_probe.py). get_config().
+        // sampler_weight_cap is a huge sentinel (no-op) unless
+        // model.sampler.weight_cap is set in the config.
+        result.weight = min(result.weight, float3(NeuralMaterialConfig_<HASH>.sampler_weight_cap));
 
         result.flags = BSDFFlags::non_delta_reflection;
         return true;
@@ -85,7 +109,7 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
             return 0.f;
 
         let config = get_config();
-        let latents = config.latents.get_bilinear_stochastic({ material_id, mip_level, si.uv }, texel_sample);
+        let latents = this.cached_latents;
         let params = config.sampler.decode_params({ latents, wi });
         return config.sampler.pdf(wi, wo, params);
     }
@@ -141,6 +165,10 @@ public struct NeuralMaterial_<HASH> : IMaterial
         }
         mip_level = max(0, min(mip_level, NeuralMaterialConfig_<HASH>.num_mip_levels - 1));
 
-        return NeuralMaterialInstance_<HASH>(material_id, mip_level, g.texel_sample, config_handle);
+        // Decoded once here (reusing the `config` already loaded above for
+        // texture_resolution) and cached on the instance -- see the field
+        // comment on NeuralMaterialInstance_<HASH>.cached_latents.
+        let latents = config.latents.get_bilinear_stochastic({ material_id, mip_level, si.uv }, g.texel_sample);
+        return NeuralMaterialInstance_<HASH>(material_id, mip_level, g.texel_sample, config_handle, latents);
     }
 };

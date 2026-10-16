@@ -17,6 +17,7 @@ class MLP(nn.ModelChain):
         hidden_layers: list[int],
         hidden_activations: list[str] | str,
         use_biases: bool = True,
+        quantization: nn.WeightQuantization | None = None,
     ):
         num_hidden_layers = len(hidden_layers)
         if isinstance(hidden_activations, str):
@@ -34,6 +35,7 @@ class MLP(nn.ModelChain):
                     num_inputs,
                     num_outputs,
                     use_biases,
+                    quantization=quantization,
                 )
             ]
         else:
@@ -42,6 +44,7 @@ class MLP(nn.ModelChain):
                     num_inputs,
                     hidden_layers[0],
                     use_biases,
+                    quantization=quantization,
                 ),
                 getattr(nn, hidden_activations[0])(),
             ]
@@ -52,6 +55,7 @@ class MLP(nn.ModelChain):
                         hidden_layers[i],
                         hidden_layers[i + 1],
                         use_biases,
+                        quantization=quantization,
                     ),
                     getattr(nn, hidden_activations[i + 1])(),
                 ]
@@ -61,6 +65,7 @@ class MLP(nn.ModelChain):
                     hidden_layers[-1],
                     num_outputs,
                     use_biases,
+                    quantization=quantization,
                 )
             ]
 
