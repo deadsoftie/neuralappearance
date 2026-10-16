@@ -80,8 +80,31 @@ float[3] eval_target_bsdf_lod(
 
     // Stochastic prefiltering inside a Gaussian kernel.
     float sigma = filter_sigma(mip_level, texture_resolution);
+
+    // `filter_sigma` returns exactly 0 at mip 0 (data_generator.slang), and
+    // `sample_2d_gaussian` with sigma 0 returns the mean unchanged -- so
+    // every one of the `num_prefilter_samples` draws below would evaluate
+    // the material at the SAME uv. Collapsing to a single evaluation there
+    // is not an approximation of the filter; the filter is the identity.
+    //
+    // Two reasons this matters, both measured rather than assumed:
+    //   - Cost. With `num_mip_levels: 2`, `sample_mip_level` puts 2/3 of all
+    //     training samples at mip 0, so the redundant draws dominated
+    //     data generation (~63% of GPU time per train.py's own timing line).
+    //   - Comparability. Configs with `num_mip_levels: 1` never reach this
+    //     function at all -- they take `eval_target_bsdf` above, which does
+    //     exactly one evaluation. Without this early-out, turning mips on
+    //     also silently switched mip 0 to 64-sample-averaged targets, so a
+    //     mip-vs-no-mip comparison would have confounded band-limiting with
+    //     a quieter target signal (`mi.eval` is stochastic for layered
+    //     materials, so those draws really did denoise).
+    //
+    // `eval_reference` (falcor_bsdf_data_generator.py) already branches the
+    // same way for the reference path; this brings the training path in line.
+    uint num_samples = (sigma > 0.f) ? max(1u, num_prefilter_samples) : 1u;
+
     float3 fs = { 0.f, 0.f, 0.f };
-    for (uint i = 0; i < num_prefilter_samples; ++i)
+    for (uint i = 0; i < num_samples; ++i)
     {
         float2 uv_filter = sample_2d_gaussian(next_float2(sg), uv, sigma);
         if (snap_to_texel_center)
@@ -92,7 +115,7 @@ float[3] eval_target_bsdf_lod(
         let mi = material.setup_material_instance(sd, ExplicitLodSampler(0.f));
         fs += mi.eval(sd, wo, sg);
     }
-    fs /= num_prefilter_samples;
+    fs /= num_samples;
     return { fs.x, fs.y, fs.z };
 }
 

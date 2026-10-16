@@ -98,10 +98,10 @@ def _unpack_quantized_grid(buf: bytes) -> tuple[int, int, int, float, float, np.
 
 class NtcLatentTexture(IModel):
     """NTC-style compressed latent texture: a pair of bilinearly-sampled
-    feature grids per tile (high-res, low-res, both at a resolution lower
-    than the output texture), decoded into the shared ``num_latents``-
-    channel code by a small fixed MLP, instead of one dense per-texel
-    buffer. See ``model/ntc_latent_texture.slang`` and rtcnam/PLAN.md for
+    feature grids per (tile, mip) -- high-res and low-res, both at a
+    resolution lower than the output texture -- decoded into the shared
+    ``num_latents``-channel code by a small fixed MLP, instead of one dense
+    per-texel buffer. See ``model/ntc_latent_texture.slang`` and rtcnam/PLAN.md for
     the exact grid-shape/decoder recipe this mirrors (NVIDIA's shipped
     RTXNTC SDK) and the Slang file's header comment for what this first
     implementation simplifies away.
@@ -216,6 +216,23 @@ class NtcLatentTexture(IModel):
         self.quantize_high_res_ranges: list[tuple[float, float]] = []
         self.quantize_low_res_ranges: list[tuple[float, float]] = []
 
+        # Set by `freeze_grids()`. Splits this model's two parameter groups
+        # apart: the grids stop being trainable while the decode MLP stays
+        # trainable. See that method for why the quantize tail needs this.
+        self.grids_frozen = False
+
+    @property
+    def decoder_input_width(self) -> int:
+        """Width of the decode MLP's input vector: both grids' features, the
+        positional encoding's four terms per octave, and the LOD scalar.
+
+        Single source of truth on purpose -- `model_init` builds the MLP from
+        this and `type_name` bakes it into the Slang type's template
+        arguments, so two independent copies of the expression would be a
+        silent Python/Slang layout mismatch the moment one of them changed.
+        """
+        return 2 * self.num_features + 4 * self.num_pos_enc_waves + 1
+
     def _grid_resolutions(self, material_id: int, mip_level: int) -> tuple[int, int]:
         # Mirrors dense `LatentTexture.resolution()`'s `base_resolution >>
         # mip_level` downscale, applied before the grid-size-scale division
@@ -264,17 +281,16 @@ class NtcLatentTexture(IModel):
             module.device, np.array(self.material_texture_resolution, dtype=np.int32)
         )
 
-        decoder_input_width = 2 * self.num_features + 4 * self.num_pos_enc_waves + 1
         self.decoder = MLP(
             dtype=Real.half,
-            num_inputs=decoder_input_width,
+            num_inputs=self.decoder_input_width,
             num_outputs=self.num_latents,
             hidden_layers=self.decoder_hidden_layers,
             hidden_activations=self.decoder_activation,
             quantization=self.decoder_quantization,
         )
         self.decoder.set_parent(self)
-        self.decoder.initialize(module, f'float[{decoder_input_width}]')
+        self.decoder.initialize(module, f'float[{self.decoder_input_width}]')
 
         self.module = module
 
@@ -296,11 +312,48 @@ class NtcLatentTexture(IModel):
         """
 
     def make_optimizable(self) -> None:
+        # `grids_frozen` has to survive this call. `InstancedComponent.
+        # start_training()` invokes it unconditionally for any latent-texture
+        # component, so without this guard, asking the training loop to train
+        # the decode MLP would silently re-arm the grids as well -- exactly
+        # what the quantize tail must not do.
+        if self.grids_frozen:
+            return
         if self.optimizable:
             return
         self.optimizable = True
         for grid in self.high_res_grids + self.low_res_grids:
             grid.make_optimizable()
+
+    def freeze_grids(self) -> None:
+        """Make the grids non-trainable while leaving the decode MLP trainable.
+
+        The quantize tail needs exactly this split. RTXNTC's recipe (and
+        rtcnam/PLAN.md's own description of it) is "freeze the grid, fine-tune
+        the network": the decode MLP is the thing that reads the rounded grid
+        values directly, so it is the thing best placed to absorb the
+        rounding error. Without this method the two could not be separated --
+        both are parameters of this one model, so marking the component
+        trainable trained the grids too, and leaving it untrained froze the
+        decode MLP along with them.
+
+        Two mechanisms, both needed:
+
+        - ``model_params()`` stops reporting the grid buffers, so the
+          optimizer never sees them. This is the load-bearing one: merely
+          clearing ``Texture.optimizable`` would not be enough, because
+          ``Texture.get_this()`` aliases ``buffer_grads`` onto the data
+          buffer for non-optimizable textures (SlangPy cannot bind null), so
+          an optimizer still holding those params would read grid *data* as
+          if it were gradients and destroy the grid.
+        - Each grid's ``optimizable`` flag is cleared, which makes
+          ``texture.slang``'s ``get_bilinear`` call ``detach()`` and skip the
+          atomic gradient scatter entirely. Not required for correctness
+          given the above, but it removes the wasted atomics.
+        """
+        self.grids_frozen = True
+        for grid in self.high_res_grids + self.low_res_grids:
+            grid.optimizable = False
 
     def quantize_grids(self, bits: int) -> list[dict]:
         """4-bit (or ``bits``-bit) quantize every grid in place: round each
@@ -396,16 +449,19 @@ class NtcLatentTexture(IModel):
 
     @property
     def type_name(self) -> str:
-        decoder_input_width = 2 * self.num_features + 4 * self.num_pos_enc_waves + 1
         return (
             f'NtcLatentTexture<{self.num_tiles}, {self.num_mip_levels}, {self.num_features}, '
-            f'{self.num_pos_enc_waves}, {self.num_latents}, {decoder_input_width}, '
+            f'{self.num_pos_enc_waves}, {self.num_latents}, {self.decoder_input_width}, '
             f'{self.decoder.type_name}>'
         )
 
     def model_params(self):
         # Grid buffers are this model's own parameters; the decoder's
-        # weights are collected separately through `children()`.
+        # weights are collected separately through `children()`. Reporting
+        # none of them is how `freeze_grids()` keeps the grids out of the
+        # optimizer while the decode MLP keeps training -- see that method.
+        if self.grids_frozen:
+            return []
         return [grid.buffer for grid in self.high_res_grids + self.low_res_grids]
 
     def model_data(self):
@@ -533,6 +589,17 @@ class NtcLatentTexture(IModel):
         self.quantize_bits = bits_seen
         self.quantize_high_res_ranges = high_res_ranges
         self.quantize_low_res_ranges = low_res_ranges
+
+        if quantized_any:
+            # A grid that was loaded from the packed format is already
+            # rounded to its quantization lattice, and continuous optimizer
+            # updates would walk it straight back off that lattice -- the
+            # values would no longer survive a round trip through the same
+            # packed format they were just read from. Freezing here makes
+            # that failure impossible rather than merely unlikely; the decode
+            # MLP stays trainable, which is the half that is supposed to
+            # adapt to quantization anyway (see `freeze_grids`).
+            self.freeze_grids()
 
         # A checkpoint on disk holds real trained grid values, so anything
         # loading one (the visualizer, render_headless, a repeat training

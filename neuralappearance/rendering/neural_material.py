@@ -100,6 +100,27 @@ class NeuralMaterial(f2.Material):
         if sampler_weight_cap is None:
             sampler_weight_cap = 3.402823e38
 
+        # rtcnam: decode the latent once per shading-point visit and reuse it
+        # across eval/sample/eval_pdf, instead of each of them re-fetching.
+        # Worth it only when a fetch is expensive. For `NtcLatentTexture` a
+        # fetch is 8 texel taps plus a decode-MLP forward pass, and caching
+        # measured ~25% faster end to end. For the dense `LatentTexture` a
+        # fetch is one buffer read, and caching measured ~30% SLOWER: the
+        # cache is populated eagerly in setup_material_instance(), before the
+        # `wi.z <= 0` early-outs in eval/sample/eval_pdf, so backfacing hits
+        # go from zero fetches to one, and the cached vector adds per-thread
+        # state through the hot path for no gain.
+        #
+        # That regression is not just a lost optimization -- the dense path is
+        # this project's own measurement baseline, so slowing it down biases
+        # every dense-vs-NTC render comparison in NTC's favour. Hence a
+        # compile-time switch rather than one behavior for both.
+        # Imported here rather than at module scope only to keep this module's
+        # import graph one-directional (`model` never imports `rendering`).
+        from model import NtcLatentTexture
+
+        cache_latents = isinstance(latents, NtcLatentTexture)
+
         return _NEURAL_MATERIAL_CONFIG_TEMPLATE.format(
             latents_type=latents.type_name,
             decoder_type=decoder.type_name,
@@ -107,6 +128,7 @@ class NeuralMaterial(f2.Material):
             aux_type=aux_type,
             num_mip_levels=neural_model.num_mip_levels,
             sampler_weight_cap=sampler_weight_cap,
+            cache_latents='true' if cache_latents else 'false',
         )
 
     def _write_config_buffer(
@@ -141,6 +163,7 @@ public struct NeuralMaterialConfig_<HASH>
 {{
     static const int num_mip_levels = {num_mip_levels};
     static const float sampler_weight_cap = {sampler_weight_cap};
+    static const bool cache_latents = {cache_latents};
     public LatentTexture_<HASH> latents;
     public Decoder_<HASH> decoder;
     public Sampler_<HASH> sampler;

@@ -1034,11 +1034,8 @@ def training_ntc_warmstart(job: TrainingJob) -> None:
         end_scale=min(1.0, config['training']['optimizer']['cosine_annealing_scale']),
         num_iterations=num_iterations,
     )
-    configured_batch_instance_scheduler = BatchInstanceScheduler(
-        config['training']['instance_schedule'], config['data_generation']['batch_size_schedule']
-    )
-    batch_instance_scheduler = BatchInstanceScheduler(
-        [neural_model.num_instances], [configured_batch_instance_scheduler.batch_sizes[-1]]
+    batch_instance_scheduler = _single_instance_batch_scheduler(
+        config, neural_model.num_instances
     )
 
     neural_model.start_training(neural_model.latent_texture)
@@ -1081,6 +1078,36 @@ def training_ntc_warmstart(job: TrainingJob) -> None:
     # `training_bsdf_diropt()` runs next and calls
     # `neural_model.start_training(neural_model.latent_texture)` itself,
     # which resets the status regardless.
+
+
+def _single_instance_batch_scheduler(config: dict, num_instances: int) -> BatchInstanceScheduler:
+    """Batch/instance schedule for the phases that run at a fixed instance
+    count (ntc warm-start, direct optimization, decoder repair).
+
+    Those phases historically pinned the batch size to the configured
+    schedule's LAST entry for their whole duration -- the instance schedule
+    has already pruned to one candidate by then, so there is nothing left to
+    ramp instances for, and the largest batch gives the least noisy gradient.
+
+    `data_generation.ramp_batch_in_single_instance_phases` opts into ramping
+    the batch size across these phases too, reusing the configured
+    `batch_size_schedule` as-is. That is worth having since mips landed:
+    with `num_mip_levels > 1` the data generator prefilters every target, so
+    cost scales with batch size far more steeply than it used to, and these
+    phases spend 100% of their iterations at the largest batch. Ramping
+    trades some early-iteration gradient quality for a much cheaper first
+    half of each phase.
+
+    Default is False -- unset in every existing config, so every existing
+    run's schedule is unchanged.
+    """
+    configured = BatchInstanceScheduler(
+        config['training']['instance_schedule'],
+        config['data_generation']['batch_size_schedule'],
+    )
+    if config['data_generation'].get('ramp_batch_in_single_instance_phases', False):
+        return BatchInstanceScheduler([num_instances], configured.batch_sizes)
+    return BatchInstanceScheduler([num_instances], [configured.batch_sizes[-1]])
 
 
 def _diropt_regularizer_params(config: dict) -> dict:
@@ -1165,13 +1192,8 @@ def training_bsdf_diropt(job: TrainingJob) -> None:
             num_iterations=config['training']['num_iterations']['bsdf'],
         )
 
-    configured_batch_instance_scheduler = BatchInstanceScheduler(
-        config['training']['instance_schedule'],
-        config['data_generation']['batch_size_schedule'],
-    )
-    batch_instance_scheduler = BatchInstanceScheduler(
-        [neural_model.num_instances],
-        [configured_batch_instance_scheduler.batch_sizes[-1]],
+    batch_instance_scheduler = _single_instance_batch_scheduler(
+        config, neural_model.num_instances
     )
 
     # rtcnam: optionally leave BsdfDecoder frozen through this phase, so it
@@ -1288,7 +1310,15 @@ def training_ntc_quantize(job: TrainingJob) -> None:
 
     bits = quantize_config.get('bits', 4)
     print(f'Quantizing NTC grids to {bits}-bit ({(1 << bits) - 1} levels)...')
-    stats = neural_model.latent_texture.instances[0].quantize_grids(bits)
+    latent_texture = neural_model.latent_texture.instances[0]
+    stats = latent_texture.quantize_grids(bits)
+
+    # Freeze the grids themselves, but deliberately NOT the decode MLP:
+    # `training_bsdf_decoder_repair()` runs next and re-opens this component
+    # for training so that MLP can absorb the rounding error introduced
+    # above. `freeze_grids()` is what makes that safe -- see its docstring.
+    latent_texture.freeze_grids()
+
     for s in stats:
         print(
             f"  tile {s['tile_idx']:3d} mip {s['mip_level']} {s['kind']:8s} "
@@ -1361,6 +1391,19 @@ def training_bsdf_decoder_repair(job: TrainingJob) -> None:
     current caller (stage_a1_decoder_repair.py, stage_a2_alternating_repair.py)
     already follows this order.
 
+    One deliberate exception, added for rtcnam's quantize tail: when the
+    latent is an ``NtcLatentTexture`` whose grids are already frozen (see
+    ``NtcLatentTexture.freeze_grids()``), this function DOES set that
+    component to ``'Training'``, so its decode MLP can absorb the
+    quantization rounding error. The grids stay out of the optimizer anyway
+    in that configuration, because ``freeze_grids()`` makes
+    ``model_params()`` report none of them -- so the invariant above
+    ("the latent's texels are never written by this phase") still holds; it
+    is enforced by the frozen parameter list instead of by the component's
+    status. Every other caller is unaffected: ``grids_frozen`` is False for
+    dense latents and for any ``NtcLatentTexture`` that did not go through
+    ``training_ntc_quantize()``.
+
     Verified with a live round-trip test before this function was written;
     see PLAN.md's Phase A0 writeup.
     """
@@ -1393,16 +1436,33 @@ def training_bsdf_decoder_repair(job: TrainingJob) -> None:
         ]
     )
 
-    configured_batch_instance_scheduler = BatchInstanceScheduler(
-        config['training']['instance_schedule'],
-        config['data_generation']['batch_size_schedule'],
-    )
-    batch_instance_scheduler = BatchInstanceScheduler(
-        [neural_model.num_instances],
-        [configured_batch_instance_scheduler.batch_sizes[-1]],
+    batch_instance_scheduler = _single_instance_batch_scheduler(
+        config, neural_model.num_instances
     )
 
     neural_model.start_training(neural_model.decoder)
+
+    # rtcnam: when the latent is an `NtcLatentTexture` whose grids were just
+    # frozen by `training_ntc_quantize()`, also retrain its decode MLP here.
+    # That MLP is the network reading the rounded grid values directly, so it
+    # is the one RTXNTC's own "freeze the grid, fine-tune the network" tail
+    # (and rtcnam/PLAN.md's description of it) means -- retraining only
+    # `BsdfDecoder`, which sits a whole network downstream of the rounding,
+    # leaves the best-placed parameters untouched.
+    #
+    # Gated on `grids_frozen` rather than on the type alone: every other
+    # caller of this function (Project 4's stage_a1/stage_a2 scripts, dense
+    # latents) reaches it with an unfrozen latent and must keep the original
+    # behavior, where the latent component stays `'Done'` and entirely out of
+    # the optimizer. `freeze_grids()` is what guarantees the grids stay out of
+    # it even while the component is `'Training'`.
+    latent_texture = neural_model.latent_texture.instances[0]
+    repair_ntc_decode_mlp = (
+        isinstance(latent_texture, NtcLatentTexture) and latent_texture.grids_frozen
+    )
+    if repair_ntc_decode_mlp:
+        print('Also repairing the NTC decode MLP (grids stay frozen).')
+        neural_model.start_training(neural_model.latent_texture)
 
     assert neural_model.num_instances == 1, (
         'Decoder repair expects a single pruned decoder instance, same as '
@@ -1457,6 +1517,8 @@ def training_bsdf_decoder_repair(job: TrainingJob) -> None:
     )
 
     neural_model.decoder.status = 'Done'
+    if repair_ntc_decode_mlp:
+        neural_model.latent_texture.status = 'Done'
 
 
 def training_sampler(job: TrainingJob) -> None:

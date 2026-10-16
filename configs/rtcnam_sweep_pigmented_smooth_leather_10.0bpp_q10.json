@@ -8,11 +8,11 @@
     ],
     "training": {
         "num_iterations": {
-            "bsdf": 100000,
-            "bsdf_finetuning": 100000,
-            "decoder_repair": 20000,
-            "sampler": 50000,
-            "aux": 50000
+            "bsdf": 10000,
+            "bsdf_finetuning": 10000,
+            "decoder_repair": 2000,
+            "sampler": 5000,
+            "aux": 5000
         },
         "deterministic": true,
         "optimizer": {
@@ -62,7 +62,7 @@
                     32
                 ],
                 "decoder_activation": "HardGELU",
-                "warmstart_iterations": 20000,
+                "warmstart_iterations": 2000,
                 "quantize": {
                     "enabled": true,
                     "bits": 4
@@ -79,8 +79,8 @@
         },
         "decoder": {
             "hidden_layers": [
-                16,
-                16
+                128,
+                64
             ],
             "hidden_activations": "SmeLU",
             "output_activation": {
@@ -89,7 +89,8 @@
             },
             "half_diff_parameterization": "StableRusinkiewicz",
             "num_shading_frames": 2,
-            "direction_inputs": "WhWdZiZo"
+            "direction_inputs": "WhWdZiZo",
+            "output_clamp": 100.0
         },
         "sampler": {
             "num_specular_lobes": 1,
@@ -97,7 +98,8 @@
                 16,
                 16
             ],
-            "hidden_activations": "LeakyReLU"
+            "hidden_activations": "LeakyReLU",
+            "weight_cap": 1.0
         },
         "aux": {
             "targets": "ref_diffuse_specular_roughness_normal",
@@ -122,7 +124,7 @@
         "balanced_directional_sampling_ratio": 0.95,
         "color_augmentation": {
             "enabled": true,
-            "num_iterations": 100000,
+            "num_iterations": 10000,
             "start_ratio": 1.0,
             "end_ratio": 0.0
         },
@@ -166,5 +168,5 @@
         },
         "validation_losses": false
     },
-    "_generated_by": "rtcnam/harness/run_sweep.py -- pigmented_smooth_leather @ 10.0bpp (grid_size_scale=2, num_features=8)"
+    "_generated_by": "rtcnam/harness/run_sweep.py -- pigmented_smooth_leather @ 10.0bpp (grid_size_scale=2, num_features=8, num_mip_levels=1, num_pos_enc_waves=3), from rtcnam_template.json. QUICK LOOK at iteration_scale=0.1 ({'bsdf': 10000, 'bsdf_finetuning': 10000, 'decoder_repair': 2000, 'sampler': 5000, 'aux': 5000}) -- directional only, NOT a converged result, do not quote as one."
 }

@@ -2,8 +2,8 @@
     "reference_materials": [
         {
             "type": "mdl",
-            "path": "vMaterials_2/Fabric/Velvet.mdl",
-            "material": "Velvet"
+            "path": "vMaterials_2/Leather/Pigmented_Smooth_Leather.mdl",
+            "material": "Pigmented_Smooth_Leather"
         }
     ],
     "training": {
@@ -49,7 +49,7 @@
         "seed": 0,
         "latents": {
             "type": "ntc_grid",
-            "num_mip_levels": 1,
+            "num_mip_levels": 2,
             "num_channels": 8,
             "normalize": false,
             "ntc_grid": {
@@ -79,8 +79,8 @@
         },
         "decoder": {
             "hidden_layers": [
-                16,
-                16
+                64,
+                32
             ],
             "hidden_activations": "SmeLU",
             "output_activation": {
@@ -89,7 +89,8 @@
             },
             "half_diff_parameterization": "StableRusinkiewicz",
             "num_shading_frames": 2,
-            "direction_inputs": "WhWdZiZo"
+            "direction_inputs": "WhWdZiZo",
+            "output_clamp": 100.0
         },
         "sampler": {
             "num_specular_lobes": 1,
@@ -97,7 +98,8 @@
                 16,
                 16
             ],
-            "hidden_activations": "LeakyReLU"
+            "hidden_activations": "LeakyReLU",
+            "weight_cap": 1.0
         },
         "aux": {
             "targets": "ref_diffuse_specular_roughness_normal",
@@ -111,10 +113,10 @@
     "data_generation": {
         "seed": 0,
         "batch_size_schedule": [
+            "256",
             "1k",
             "4k",
-            "16k",
-            "64k"
+            "16k"
         ],
         "num_batches_per_generation": 64,
         "share_data_between_instances": true,
@@ -166,5 +168,5 @@
         },
         "validation_losses": false
     },
-    "_generated_by": "rtcnam/harness/run_sweep.py -- velvet @ 5.00bpp (grid_size_scale=4, num_features=16)"
+    "_generated_by": "rtcnam/MIP_SAMPLING_PLAN.md Stage 5 -- real (non-smoke-test) validation that mip-aware NtcLatentTexture actually reduces the crosshatch minification-aliasing bug this whole plan exists to fix. Decoder-capacity-matched against rtcnam_fix7_pigmented_smooth_leather_5.00bpp.json (whose actual run lives at .jobs/rtcnam_fixed2_pigmented_smooth_leather_5.00bpp -- renamed on disk after running), NOT fix8: decoder.hidden_layers [64,32] here, same as fix7, by explicit request -- known to leave a ~3% residual overexposure bug on top of whatever this changes, per fix7's own _generated_by note, so this run's results are NOT clean evidence about mip-aliasing in isolation; they're confounded with that known partial decoder-capacity shortfall. Compare against fixed2 (fix7, single-mip), not fixed3/fix8. Otherwise identical to fix7 except model.latents.num_mip_levels: 1 -> 2, AND data_generation.batch_size_schedule's top tier cut 64k -> 16k (256/1k/4k/16k instead of 1k/4k/16k/64k) -- first attempt at num_mip_levels: 2 kept the 64k top batch and was OOM-killed at BsdfEncoding iteration 75008/100000 (no checkpoint saved); real prefiltering (num_prefilter_samples: 64, inert at num_mip_levels: 1, now live) multiplies per-iteration intermediate buffer size by the prefilter sample count on top of batch size, and 65536*64 was too much. Kept num_prefilter_samples at the real 64 (not cut to the smoke test's 16) so this stays apples-to-apples with default.json's documented prefilter setting; traded batch size instead."
 }

@@ -111,7 +111,12 @@ bool sample_uniform_rusinkiewicz(float4 u, out float3 wi, out float3 wo)
  */
 float2 sample_2d_gaussian(float2 u, float2 mu, float sigma)
 {
-    float r = sqrt(-2.0f * log(u.x));
+    // `u.x == 0` is in range for the sample generators feeding this, and
+    // `log(0)` would make `r` infinite -- which at `sigma == 0` yields
+    // `0 * inf = NaN` and poisons the returned UV. Clamping costs nothing
+    // measurable: it only changes draws with u.x < 1e-7, where it caps r at
+    // 5.68 instead of letting it run to infinity.
+    float r = sqrt(-2.0f * log(max(u.x, 1e-7f)));
     float phi = float.TWO_PI * u.y;
     float2 xy = r * float2(cos(phi), sin(phi));
     return mu + sigma * xy;

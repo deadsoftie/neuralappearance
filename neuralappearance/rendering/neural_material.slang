@@ -26,6 +26,13 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
     // for NtcLatentTexture -- see rtcnam/results/README.md's "Render-time
     // cost" section). Safe because material_id/mip_level/texel_sample/
     // si.uv are already identical across all three calls for one hit.
+    //
+    // Only populated when `NeuralMaterialConfig_<HASH>.cache_latents` is
+    // true, i.e. for NtcLatentTexture. The dense path leaves it at its
+    // default and re-fetches per call through `get_latents()` below --
+    // caching measured ~30% SLOWER there, because this is filled eagerly
+    // before the `wi.z <= 0` early-outs and a dense fetch is cheaper than
+    // the extra always-on work. See rendering/neural_material.py.
     float[<NUM_LATENTS>] cached_latents;
 
     __init(
@@ -46,6 +53,16 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
         return handle.load_aligned<NeuralMaterialConfig_<HASH>, 16>(0);
     }
 
+    // Either hands back the value setup_material_instance() already decoded,
+    // or does the fetch now -- a compile-time branch on a `static const`, so
+    // exactly one of the two survives codegen for any given architecture.
+    float[<NUM_LATENTS>] get_latents(const NeuralMaterialConfig_<HASH> config, const SurfaceInteraction si)
+    {
+        if (NeuralMaterialConfig_<HASH>.cache_latents)
+            return this.cached_latents;
+        return config.latents.get_bilinear_stochastic({ material_id, mip_level, si.uv }, texel_sample);
+    }
+
     public float3 eval<S : ISampleGenerator>(const SurfaceInteraction si, const float3 wo_ws, inout S sg)
     {
         float3 wi = si.shading_frame_ws.to_local(si.wi_ws);
@@ -54,7 +71,7 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
             return float3(0.f);
 
         let config = get_config();
-        let latents = this.cached_latents;
+        let latents = get_latents(config, si);
         let result = config.decoder.forward({ material_id, mip_level, latents, wi, wo });
         var f = float3(result[0], result[1], result[2]);
         f = max(f, float3(0.f));
@@ -72,7 +89,7 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
             return false;
 
         let config = get_config();
-        let latents = this.cached_latents;
+        let latents = get_latents(config, si);
         let params = config.sampler.decode_params({ latents, wi });
 
         float3 wo = config.sampler.sample(wi, next_float3(sg), params);
@@ -109,7 +126,7 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
             return 0.f;
 
         let config = get_config();
-        let latents = this.cached_latents;
+        let latents = get_latents(config, si);
         let params = config.sampler.decode_params({ latents, wi });
         return config.sampler.pdf(wi, wo, params);
     }
@@ -167,8 +184,13 @@ public struct NeuralMaterial_<HASH> : IMaterial
 
         // Decoded once here (reusing the `config` already loaded above for
         // texture_resolution) and cached on the instance -- see the field
-        // comment on NeuralMaterialInstance_<HASH>.cached_latents.
-        let latents = config.latents.get_bilinear_stochastic({ material_id, mip_level, si.uv }, g.texel_sample);
+        // comment on NeuralMaterialInstance_<HASH>.cached_latents. Skipped
+        // entirely when caching is off: this runs before eval/sample/
+        // eval_pdf's own `wi.z <= 0` early-outs, so for a cheap dense fetch
+        // it is net-negative work on backfacing hits. Compile-time branch.
+        float[<NUM_LATENTS>] latents = {};
+        if (NeuralMaterialConfig_<HASH>.cache_latents)
+            latents = config.latents.get_bilinear_stochastic({ material_id, mip_level, si.uv }, g.texel_sample);
         return NeuralMaterialInstance_<HASH>(material_id, mip_level, g.texel_sample, config_handle, latents);
     }
 };

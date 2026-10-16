@@ -1,9 +1,38 @@
+// rtcnam sweep template -- the base config rtcnam/harness/run_sweep.py
+// clones for every (material, bpp preset, mips) combo. build_config()
+// overwrites reference_materials, latents.num_mip_levels and
+// latents.ntc_grid.{grid_size_scale,num_features} per combo, and
+// --iteration-scale rewrites the iteration counts; everything else here is
+// the recipe under test and is shared by every run in a sweep.
+//
+// NAMED DELIBERATELY OUTSIDE THE rtcnam_sweep_* NAMESPACE. The per-combo
+// configs the sweep generates are rtcnam_sweep_<combo>.json, so a template
+// called rtcnam_sweep_template.json sat inside the glob used to clean those
+// up -- and was duly deleted by it. run_sweep.py now also fails fast with a
+// clear message if this file is missing, rather than dying inside a parse.
+//
+// Replaces the old template (rtcnam_pilot_carpaint_metallic_1.11bpp_quantized.json),
+// which predated the decoder-capacity investigation and therefore baked in
+// the configuration that PRODUCED the broken 5/10/20bpp sweep results
+// (robust PSNR -17dB, frac>100 up to 0.568). Three differences, all from the
+// fix7/fix8 lineage:
+//   - model.decoder.hidden_layers [16,16] -> [128,64]. The actual fix: the
+//     BSDF decoder was capacity-mismatched against the sharper latent field
+//     the grid resolves at the finer presets.
+//   - model.decoder.output_clamp -> 100.0. Bounds a single BSDF evaluation.
+//   - model.sampler.weight_cap -> 1.0. Bounds the indirect-bounce importance
+//     weight (bsdf / sampler pdf), which output_clamp alone does not --
+//     a clamped bsdf over a near-zero pdf still explodes.
+//
+// Also note the 1.11bpp preset was ALREADY healthy at [16,16] (+42dB); the
+// capacity fix is what the other three presets needed. Keeping one recipe
+// across all four keeps the rate-distortion curve a single-variable sweep.
 {
     "reference_materials": [
         {
             "type": "mdl",
-            "path": "vMaterials_2/Fabric/Velvet.mdl",
-            "material": "Velvet"
+            "path": "vMaterials_2/Paint/Carpaint/Carpaint_Metallic.mdl",
+            "material": "Carpaint_Metallic"
         }
     ],
     "training": {
@@ -79,8 +108,8 @@
         },
         "decoder": {
             "hidden_layers": [
-                16,
-                16
+                128,
+                64
             ],
             "hidden_activations": "SmeLU",
             "output_activation": {
@@ -89,7 +118,8 @@
             },
             "half_diff_parameterization": "StableRusinkiewicz",
             "num_shading_frames": 2,
-            "direction_inputs": "WhWdZiZo"
+            "direction_inputs": "WhWdZiZo",
+            "output_clamp": 100.0
         },
         "sampler": {
             "num_specular_lobes": 1,
@@ -97,7 +127,8 @@
                 16,
                 16
             ],
-            "hidden_activations": "LeakyReLU"
+            "hidden_activations": "LeakyReLU",
+            "weight_cap": 1.0
         },
         "aux": {
             "targets": "ref_diffuse_specular_roughness_normal",
@@ -165,6 +196,5 @@
             "save": true
         },
         "validation_losses": false
-    },
-    "_generated_by": "rtcnam/harness/run_sweep.py -- velvet @ 1.11bpp (grid_size_scale=6, num_features=8)"
+    }
 }

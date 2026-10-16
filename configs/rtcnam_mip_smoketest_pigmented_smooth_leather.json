@@ -1,4 +1,13 @@
 {
+    // rtcnam/MIP_SAMPLING_PLAN.md, Stage 3 ("turn training on"): the first
+    // real end-to-end exercise of NtcLatentTexture's mip-aware grid storage
+    // (Stage 1) and checkpoint I/O (Stage 2) with num_mip_levels > 1. Not a
+    // quality run -- iteration counts are cut drastically from the
+    // rtcnam_pilot_* configs this is otherwise identical to, purely to
+    // smoke-test that the never-before-exercised multi-mip training path
+    // (prefiltered data generation, mip-sampled warm-start, mip-aware
+    // checkpoint save/load) runs end to end without crashing and produces
+    // the expected per-mip grid files on disk.
     "reference_materials": [
         {
             "type": "mdl",
@@ -6,13 +15,12 @@
             "material": "Pigmented_Smooth_Leather"
         }
     ],
+
     "training": {
         "num_iterations": {
-            "bsdf": 100000,
-            "bsdf_finetuning": 100000,
-            "decoder_repair": 20000,
-            "sampler": 50000,
-            "aux": 50000
+            "bsdf": 300,
+            "bsdf_finetuning": 300,
+            "decoder_repair": 300
         },
         "deterministic": true,
         "optimizer": {
@@ -27,42 +35,31 @@
                 "ignore_invalid_gradients": true
             }
         },
-        "instance_schedule": [
-            64,
-            16,
-            4,
-            1
-        ],
+        "instance_schedule": [8, 4, 2, 1],
         "loss_function": {
             "type": "L1WithPowerLog",
             "power": 3.0,
-            "epsilon": 0.0001
-        },
-        "coverage_penalty": {
-            "weight": 0.0,
-            "cap": 5.0,
-            "samples": 8
-        },
-        "freeze_decoder_during_diropt": false
+            "epsilon": 1e-4
+        }
     },
+
     "model": {
         "seed": 0,
         "latents": {
             "type": "ntc_grid",
-            "num_mip_levels": 1,
+            "num_mip_levels": 2,
             "num_channels": 8,
             "normalize": false,
             "ntc_grid": {
                 "grid_size_scale": 6,
                 "num_features": 8,
                 "num_pos_enc_waves": 3,
-                "decoder_hidden_layers": [
-                    64,
-                    48,
-                    32
-                ],
+                "decoder_hidden_layers": [64, 48, 32],
                 "decoder_activation": "HardGELU",
-                "warmstart_iterations": 20000,
+                "warmstart_iterations": 300,
+                // Exercises the quantize -> freeze_grids -> decoder_repair
+                // tail, including the decode MLP being retrained against the
+                // frozen quantized grid.
                 "quantize": {
                     "enabled": true,
                     "bits": 4
@@ -70,90 +67,70 @@
             }
         },
         "encoder": {
-            "hidden_layers": [
-                64,
-                64,
-                64
-            ],
+            "hidden_layers": [64, 64, 64],
             "hidden_activations": "LeakyReLU"
         },
         "decoder": {
-            "hidden_layers": [
-                16,
-                16
-            ],
+            "hidden_layers": [16, 16],
             "hidden_activations": "SmeLU",
             "output_activation": {
                 "type": "ScaledSigmoid",
-                "scale": 100000.0
+                "scale": 1e5
             },
             "half_diff_parameterization": "StableRusinkiewicz",
             "num_shading_frames": 2,
             "direction_inputs": "WhWdZiZo"
-        },
-        "sampler": {
-            "num_specular_lobes": 1,
-            "hidden_layers": [
-                16,
-                16
-            ],
-            "hidden_activations": "LeakyReLU"
-        },
-        "aux": {
-            "targets": "ref_diffuse_specular_roughness_normal",
-            "hidden_layers": [
-                16,
-                16
-            ],
-            "hidden_activations": "SmeLU"
         }
+        // No "sampler"/"aux" sections -- those phases are orthogonal to the
+        // mip-sampling path under test, so leaving them out skips them
+        // entirely (NeuralModel builds neither component when its config
+        // section is absent) instead of spending time training them.
     },
+
     "data_generation": {
         "seed": 0,
-        "batch_size_schedule": [
-            "1k",
-            "4k",
-            "16k",
-            "64k"
-        ],
-        "num_batches_per_generation": 64,
+        "batch_size_schedule": ["1k", "4k", "16k", "64k"],
+        "num_batches_per_generation": 16,
         "share_data_between_instances": true,
         "directional_sampling_strategy": "Balanced_UniformRusinkiewicz_UniformWiImportanceWo",
         "balanced_directional_sampling_ratio": 0.95,
         "color_augmentation": {
             "enabled": true,
-            "num_iterations": 100000,
+            "num_iterations": 300,
             "start_ratio": 1.0,
             "end_ratio": 0.0
         },
+        // num_mip_levels > 1 turns on real prefiltering
+        // (falcor_bsdf_data_generator.py's `prefilter_target`) -- this is
+        // the never-before-exercised path Stage 3 exists to test. Sample
+        // counts cut from the pilot configs' 64/256 purely for smoke-test
+        // speed, not correctness.
         "lod": {
-            "num_prefilter_samples": 64,
-            "num_prefilter_samples_reference": 256
+            "num_prefilter_samples": 16,
+            "num_prefilter_samples_reference": 64
         }
     },
+
     "checkpoints": {
         "period": -1,
-        "phases": [
-            "BsdfEncoding",
-            "BsdfDirectOptimization",
-            "Sampler",
-            "Aux"
-        ],
+        // Only the phase that actually trains the grid. Skips the
+        // BsdfEncoding checkpoint entirely to save time; that phase's
+        // latents aren't meaningful yet (NtcLatentTexture.generate_from_encoder
+        // is a no-op -- see its docstring).
+        "phases": ["BsdfDirectOptimization"],
         "rendering": {
-            "spp": 16,
-            "max_depth": 10,
+            "spp": 4,
+            "max_depth": 4,
             "save_reference": true,
             "save_neural": true,
             "all_udims": false,
             "format": "exr"
         },
         "bsdf_plots": {
-            "save": true,
+            "save": false,
             "num_uvs": 5,
             "num_samples": 1000,
-            "axes": [
-                "log"
-            ],
+            "axes": ["log"],
             "resolution": 450,
             "udim_id": -1
         },
@@ -162,9 +139,8 @@
             "save_params": true
         },
         "loss_plots": {
-            "save": true
+            "save": false
         },
         "validation_losses": false
-    },
-    "_generated_by": "rtcnam/harness/run_sweep.py -- pigmented_smooth_leather @ 1.11bpp (grid_size_scale=6, num_features=8)"
+    }
 }

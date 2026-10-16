@@ -9,9 +9,11 @@ __exported import util.texture_helpers;
 
 // NTC-style compressed latent texture. Instead of one dense per-texel
 // buffer (``LatentTexture``), this stores a PAIR of bilinearly-sampled
-// feature grids per tile -- both at a resolution lower than the output
-// texture by ``grid_size_scale`` (high-res) and half that again (low-res),
-// each with ``NumFeatures`` channels -- and a small fixed decode MLP that
+// feature grids per (tile, mip) -- both at a resolution lower than that
+// mip's output texture by ``grid_size_scale`` (high-res) and half that
+// again (low-res), each with ``NumFeatures`` channels, flattened as
+// ``tile_idx * NumMipLevels + mip_level`` exactly like the dense path's
+// own mip chain -- and a small fixed decode MLP that
 // turns a (high-res sample, low-res sample, positional encoding, LOD)
 // tuple into the ``NumLatents``-channel code every other RTNAM component
 // (BsdfDecoder, Sampler, AuxDecoder, the renderer, the visualizer) already
@@ -65,7 +67,7 @@ struct NtcLatentTexture<
         // pattern (plain helper returning a non-differentiable type, called
         // without `no_diff` at all).
         let grid_resolution = get_grid_resolution(grid_idx);
-        let texture_resolution = get_material_resolution(input.material_id);
+        let texture_resolution = get_texture_resolution(input.material_id);
         let wrap = get_material_wrap(input.material_id);
         // RTXNTC's `positionScale` (TextureSet.cpp:461):
         //   positionScale = 0.5 * latentGridWidth / colorMipWidth
@@ -76,7 +78,7 @@ struct NtcLatentTexture<
         // the top octave (3 waves) is 2x the grid resolution -- it encodes
         // *sub-cell* position, just past the grid's own Nyquist limit.
         float[4 * NumPosEncWaves] pos_enc =
-            encode_position<NumPosEncWaves>(input.uv, grid_resolution, wrap);
+            encode_position<NumPosEncWaves>(input.uv, grid_resolution, wrap, input.mip_level);
         // RTXNTC feeds `positionLod` here, not the raw mip index
         // (TextureSet.cpp:462). Computed in a plain helper, like the others.
         float lod = get_position_lod(grid_resolution, texture_resolution, input.mip_level);
@@ -160,11 +162,6 @@ struct NtcLatentTexture<
         // "pick one texel" variant the way there is for a dense buffer, so
         // this ignores `sample` and decodes the same way `get_bilinear` does.
         return get_bilinear(input);
-    }
-
-    int get_material_resolution(int material_id)
-    {
-        return material_texture_resolution[material_id];
     }
 
     // Flat (tile, mip) index into `high_res_grids`/`low_res_grids`. Same ABI
@@ -254,20 +251,39 @@ struct NtcLatentTexture<
 // against the encoder's real [-0.79, 0.89]. Warm-start *training* MSE looked
 // healthy (0.0073) while the render was -240 dB -- a pure train/test gap. See
 // rtcnam/NTC_LATENT_TEXTURE_NOTES.md.
-float[4 * NumWaves] encode_position<int NumWaves>(float2 uv, int grid_resolution, bool wrap)
+//
+// Explicit band-limiting (rtcnam/MIP_SAMPLING_PLAN.md Stage 4, "explicit"
+// option, stacked on top of the "implicit" one -- the two were never
+// mutually exclusive): smoothly zero out the highest octaves as `mip_level`
+// increases, in addition to (not instead of) `grid_resolution` already
+// shrinking per mip. Standard procedural-noise mip-fade technique --
+// `keep_octaves` drops by exactly one per mip level, and each octave's own
+// weight is a 1-wide linear ramp from 1 (fully present) to 0 (fully faded)
+// centered on that cutoff.
+//
+// `mip_level == 0` is an exact, provable no-op, not a tuned-to-look-right
+// approximation: `keep_octaves == NumWaves` there, so for every valid
+// octave index `w` (0..NumWaves-1), `keep_octaves - w >= 1`, so
+// `clamp(keep_octaves - w, 0, 1) == 1` for all of them. This is true for
+// every value `NumWaves` is ever configured to, so every single-mip config
+// (every config in the repo before this plan, and mip 0 of every config
+// after it) renders byte-identical to before this change.
+float[4 * NumWaves] encode_position<int NumWaves>(float2 uv, int grid_resolution, bool wrap, int mip_level)
 {
     float2 local_uv = wrap ? (uv - floor(uv)) : max(0.f, uv);
     float2 p = local_uv * (float(grid_resolution) * 0.5f);
+    float keep_octaves = float(NumWaves) - float(mip_level);
 
     float[4 * NumWaves] result;
     int idx = 0;
     [ForceUnroll]
     for (int w = 0; w < NumWaves; ++w)
     {
-        result[idx++] = frac(p.x) * 2.f - 1.f;
-        result[idx++] = frac(p.y) * 2.f - 1.f;
-        result[idx++] = frac(p.x + 0.25f) * 2.f - 1.f;
-        result[idx++] = frac(p.y + 0.25f) * 2.f - 1.f;
+        float weight = clamp(keep_octaves - float(w), 0.f, 1.f);
+        result[idx++] = weight * (frac(p.x) * 2.f - 1.f);
+        result[idx++] = weight * (frac(p.y) * 2.f - 1.f);
+        result[idx++] = weight * (frac(p.x + 0.25f) * 2.f - 1.f);
+        result[idx++] = weight * (frac(p.y + 0.25f) * 2.f - 1.f);
         p *= 2.f;
     }
     return result;

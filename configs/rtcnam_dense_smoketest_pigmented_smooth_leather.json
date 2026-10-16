@@ -1,0 +1,123 @@
+{
+    // Dense-path counterpart to rtcnam_mip_smoketest_*.json. Exists to keep
+    // the stock `dense` latent path covered by a runnable check, because
+    // several rtcnam changes land in code BOTH paths share -- most recently
+    // the generated `NeuralMaterialConfig_<HASH>.cache_latents` switch in
+    // rendering/neural_material.{py,slang}, which selects between caching
+    // the decoded latent per shading point (right for NtcLatentTexture) and
+    // fetching per call (right for the dense buffer). Only this config
+    // exercises the `false` side of that branch.
+    //
+    // Stock dense conventions on purpose: `normalize: true` with
+    // `bsdf_finetuning: 0`, i.e. encoder bakes the latents and no direct
+    // optimization follows. Iteration counts are tiny -- this is a
+    // does-it-run check, not a quality run.
+    "reference_materials": [
+        {
+            "type": "mdl",
+            "path": "vMaterials_2/Leather/Pigmented_Smooth_Leather.mdl",
+            "material": "Pigmented_Smooth_Leather"
+        }
+    ],
+
+    "training": {
+        "num_iterations": {
+            "bsdf": 300,
+            "bsdf_finetuning": 0
+        },
+        "deterministic": true,
+        "optimizer": {
+            "learning_rate": 0.001,
+            "cosine_annealing_scale": 0.01,
+            "gradient_scale": 128.0,
+            "hyperparams": {
+                "beta1": 0.9,
+                "beta2": 0.999,
+                "epsilon": 1e-07,
+                "l2_regularization": 0.0,
+                "ignore_invalid_gradients": true
+            }
+        },
+        "instance_schedule": [8, 4, 2, 1],
+        "loss_function": {
+            "type": "L1WithPowerLog",
+            "power": 3.0,
+            "epsilon": 1e-4
+        }
+    },
+
+    "model": {
+        "seed": 0,
+        "latents": {
+            "type": "dense",
+            "num_mip_levels": 1,
+            "num_channels": 8,
+            "normalize": true
+        },
+        "encoder": {
+            "hidden_layers": [64, 64, 64],
+            "hidden_activations": "LeakyReLU"
+        },
+        "decoder": {
+            "hidden_layers": [16, 16],
+            "hidden_activations": "SmeLU",
+            "output_activation": {
+                "type": "ScaledSigmoid",
+                "scale": 1e5
+            },
+            "half_diff_parameterization": "StableRusinkiewicz",
+            "num_shading_frames": 2,
+            "direction_inputs": "WhWdZiZo"
+        }
+    },
+
+    "data_generation": {
+        "seed": 0,
+        "batch_size_schedule": ["1k", "4k", "16k", "64k"],
+        "num_batches_per_generation": 16,
+        "share_data_between_instances": true,
+        "directional_sampling_strategy": "Balanced_UniformRusinkiewicz_UniformWiImportanceWo",
+        "balanced_directional_sampling_ratio": 0.95,
+        "color_augmentation": {
+            "enabled": true,
+            "num_iterations": 300,
+            "start_ratio": 1.0,
+            "end_ratio": 0.0
+        },
+        "lod": {
+            "num_prefilter_samples": 16,
+            "num_prefilter_samples_reference": 64
+        }
+    },
+
+    "checkpoints": {
+        "period": -1,
+        // Dense with bsdf_finetuning 0 never enters BsdfDirectOptimization,
+        // so this is the only phase that can emit a render here.
+        "phases": ["BsdfEncoding"],
+        "rendering": {
+            "spp": 4,
+            "max_depth": 4,
+            "save_reference": true,
+            "save_neural": true,
+            "all_udims": false,
+            "format": "exr"
+        },
+        "bsdf_plots": {
+            "save": false,
+            "num_uvs": 5,
+            "num_samples": 1000,
+            "axes": ["log"],
+            "resolution": 450,
+            "udim_id": -1
+        },
+        "model": {
+            "save_images": true,
+            "save_params": true
+        },
+        "loss_plots": {
+            "save": false
+        },
+        "validation_losses": false
+    }
+}

@@ -159,14 +159,30 @@ class NeuralModel:
                 optimizable=False,
             )
         elif latents_type == 'ntc_grid':
-            if latents_config['num_mip_levels'] != 1:
-                raise ValueError(
-                    'model.latents.type "ntc_grid" only supports num_mip_levels == 1 '
-                    '(the grid pair itself provides the high/low-res pyramid; stacking '
-                    "RTNAM's own multi-mip Russian-roulette filtering on top is not "
-                    'implemented -- see rtcnam/PLAN.md, "Risks").'
-                )
+            # `num_mip_levels > 1` stacks RTNAM's own outer multi-mip
+            # Russian-roulette filtering on top of the grid pair's own
+            # inner high/low-res pyramid -- a deliberate divergence from
+            # RTXNTC's literal recipe, not an oversight; see
+            # rtcnam/MIP_SAMPLING_PLAN.md, "Scope decision". Used to be
+            # hard-blocked here before `NtcLatentTexture` grew mip-aware
+            # grid storage and checkpoint I/O (same file's Stage 1/2).
             ntc_config = latents_config['ntc_grid']
+
+            # Fail here rather than at the first checkpoint save. The packed
+            # grid format stores one nibble per value, so `_pack_quantized_grid`
+            # refuses anything wider than 4 bits -- but `quantize_grids()` runs
+            # near the end of training and the pack only happens at the
+            # checkpoint after it, so an out-of-range `bits` used to surface
+            # hours into a run, with the whole job lost.
+            quantize_config = ntc_config.get('quantize', {})
+            if quantize_config.get('enabled', False):
+                bits = quantize_config.get('bits', 4)
+                if not (1 <= bits <= 4):
+                    raise ValueError(
+                        'model.latents.ntc_grid.quantize.bits must be 1-4 (the packed '
+                        f'checkpoint format stores one nibble per value), got {bits}.'
+                    )
+
             decoder_quant_config = ntc_config.get('decoder_quantization', {})
             decoder_quantization = (
                 nn.WeightQuantization[decoder_quant_config['format']]
