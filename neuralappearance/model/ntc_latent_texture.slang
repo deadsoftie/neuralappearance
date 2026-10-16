@@ -27,6 +27,7 @@ __exported import util.texture_helpers;
 // identical ``params.numFeatures``.
 struct NtcLatentTexture<
     int NumTiles,
+    int NumMipLevels,
     int NumFeatures,
     int NumPosEncWaves,
     int NumLatents,
@@ -37,8 +38,8 @@ struct NtcLatentTexture<
     StructuredBuffer<int>.Handle tile_indirection;
     StructuredBuffer<int>.Handle material_texture_wrap;
     StructuredBuffer<int>.Handle material_texture_resolution;
-    Texture<NumFeatures> high_res_grids[NumTiles];
-    Texture<NumFeatures> low_res_grids[NumTiles];
+    Texture<NumFeatures> high_res_grids[NumTiles * NumMipLevels];
+    Texture<NumFeatures> low_res_grids[NumTiles * NumMipLevels];
     Decoder decoder;
 
     int get_texture_resolution(int material_id)
@@ -51,9 +52,10 @@ struct NtcLatentTexture<
     {
         let udim_idx = get_udim_index(input.material_id, input.uv);
         let tile_idx = get_tile_idx(input.material_id, udim_idx);
+        let grid_idx = get_grid_idx(tile_idx, input.mip_level);
 
-        float[NumFeatures] hi = high_res_grids[tile_idx].get_bilinear(input.uv);
-        float[NumFeatures] lo = low_res_grids[tile_idx].get_bilinear(input.uv);
+        float[NumFeatures] hi = high_res_grids[grid_idx].get_bilinear(input.uv);
+        float[NumFeatures] lo = low_res_grids[grid_idx].get_bilinear(input.uv);
 
         // Plain (non-[Differentiable]) helper calls, not an inline `no_diff`
         // subscript: an inline `no_diff material_texture_resolution[...]`
@@ -62,7 +64,7 @@ struct NtcLatentTexture<
         // `get_udim_index`/`get_tile_idx` below for the same already-proven
         // pattern (plain helper returning a non-differentiable type, called
         // without `no_diff` at all).
-        let grid_resolution = get_grid_resolution(tile_idx);
+        let grid_resolution = get_grid_resolution(grid_idx);
         let texture_resolution = get_material_resolution(input.material_id);
         let wrap = get_material_wrap(input.material_id);
         // RTXNTC's `positionScale` (TextureSet.cpp:461):
@@ -77,7 +79,7 @@ struct NtcLatentTexture<
             encode_position<NumPosEncWaves>(input.uv, grid_resolution, wrap);
         // RTXNTC feeds `positionLod` here, not the raw mip index
         // (TextureSet.cpp:462). Computed in a plain helper, like the others.
-        float lod = get_position_lod(grid_resolution, texture_resolution);
+        float lod = get_position_lod(grid_resolution, texture_resolution, input.mip_level);
 
         float[DecoderInputWidth] decoder_input;
         int idx = 0;
@@ -165,22 +167,38 @@ struct NtcLatentTexture<
         return material_texture_resolution[material_id];
     }
 
-    // High-res feature grid resolution for a tile. Plain (non-[Differentiable])
-    // helper for the same reason as the others below -- see the comment in
-    // `get_bilinear`.
-    int get_grid_resolution(int tile_idx)
+    // Flat (tile, mip) index into `high_res_grids`/`low_res_grids`. Same ABI
+    // as dense `LatentTexture::get_texture_idx` (`latent_texture.slang:68-74`):
+    // Python stores each tile's mip chain contiguously in this order.
+    int get_grid_idx(int tile_idx, int mip_level)
     {
-        return high_res_grids[tile_idx].resolution;
+        return tile_idx * NumMipLevels + mip_level;
+    }
+
+    // High-res feature grid resolution for a (tile, mip) grid pair. Plain
+    // (non-[Differentiable]) helper for the same reason as the others below
+    // -- see the comment in `get_bilinear`. Takes the already-flattened grid
+    // index, not a bare tile index.
+    int get_grid_resolution(int grid_idx)
+    {
+        return high_res_grids[grid_idx].resolution;
     }
 
     // RTXNTC's ``positionLod`` (TextureSet.cpp:462):
     //   clamp(0.25 * log2(positionScale), -1, 1)
     // A per-(tile, mip) constant, so the decode MLP's first-layer bias can
-    // absorb it in the single-mip case; kept to match RTXNTC exactly and to
-    // stay correct if latent mips are added later.
-    float get_position_lod(int grid_resolution, int texture_resolution)
+    // absorb it in the single-mip case.
+    //
+    // `texture_resolution` is the material's BASE (mip-0) color-texture
+    // resolution; RTXNTC's real formula needs the color-mip width at the
+    // same LOD as `grid_resolution`, so shrink it by `mip_level` here --
+    // matching dense `LatentTexture.resolution()`'s own `base_resolution >>
+    // mip_level` convention (`latent_texture.py:175-179`). At `mip_level ==
+    // 0` this is a no-op, so the single-mip case is bit-for-bit unchanged.
+    float get_position_lod(int grid_resolution, int texture_resolution, int mip_level)
     {
-        let position_scale = 0.5f * float(grid_resolution) / float(texture_resolution);
+        let color_mip_width = max(1, texture_resolution >> mip_level);
+        let position_scale = 0.5f * float(grid_resolution) / float(color_mip_width);
         return clamp(0.25f * log2(position_scale), -1.f, 1.f);
     }
 

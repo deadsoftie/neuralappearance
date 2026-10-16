@@ -181,6 +181,7 @@ class NeuralModel:
                 ntc_config.get('num_pos_enc_waves', 3),
                 ntc_config['decoder_hidden_layers'],
                 ntc_config.get('decoder_activation', 'HardGELU'),
+                num_mip_levels=latents_config['num_mip_levels'],
                 optimizable=False,
                 decoder_quantization=decoder_quantization,
             )

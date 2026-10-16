@@ -123,6 +123,7 @@ class NtcLatentTexture(IModel):
         num_pos_enc_waves: int,
         decoder_hidden_layers: list[int],
         decoder_activation: str,
+        num_mip_levels: int = 1,
         optimizable: bool = True,
         decoder_quantization: WeightQuantization | None = None,
     ) -> NtcLatentTexture:
@@ -133,6 +134,7 @@ class NtcLatentTexture(IModel):
             num_pos_enc_waves,
             decoder_hidden_layers,
             decoder_activation,
+            num_mip_levels,
             optimizable,
             decoder_quantization,
         )
@@ -160,6 +162,7 @@ class NtcLatentTexture(IModel):
         num_pos_enc_waves: int,
         decoder_hidden_layers: list[int],
         decoder_activation: str,
+        num_mip_levels: int = 1,
         optimizable: bool = True,
         decoder_quantization: WeightQuantization | None = None,
     ):
@@ -176,6 +179,7 @@ class NtcLatentTexture(IModel):
         self.num_pos_enc_waves = num_pos_enc_waves
         self.decoder_hidden_layers = decoder_hidden_layers
         self.decoder_activation = decoder_activation
+        self.num_mip_levels = num_mip_levels
         self.decoder_quantization = decoder_quantization
         self.optimizable = optimizable
 
@@ -212,8 +216,12 @@ class NtcLatentTexture(IModel):
         self.quantize_high_res_ranges: list[tuple[float, float]] = []
         self.quantize_low_res_ranges: list[tuple[float, float]] = []
 
-    def _grid_resolutions(self, material_id: int) -> tuple[int, int]:
-        base = self.material_texture_resolution[material_id]
+    def _grid_resolutions(self, material_id: int, mip_level: int) -> tuple[int, int]:
+        # Mirrors dense `LatentTexture.resolution()`'s `base_resolution >>
+        # mip_level` downscale, applied before the grid-size-scale division
+        # (not after) so each mip's grid stays an integer fraction of that
+        # mip's own color-texture resolution, same as mip 0.
+        base = max(1, self.material_texture_resolution[material_id] >> mip_level)
         high_res = max(1, base // self.grid_size_scale)
         low_res = max(1, high_res // 2)
         return high_res, low_res
@@ -225,21 +233,26 @@ class NtcLatentTexture(IModel):
         self.high_res_grids: list[Texture] = []
         self.low_res_grids: list[Texture] = []
 
+        # Each tile owns `num_mip_levels` consecutive (high_res, low_res) grid
+        # pairs, flattened as `tile_idx * num_mip_levels + mip_level` -- the
+        # same ABI dense `LatentTexture.model_init()` uses for its own
+        # per-(tile, mip) `textures` list (`latent_texture.py:140-148`).
         tile_idx = 0
         for material_id, udims in self.udim_mapping.items():
-            high_res, low_res = self._grid_resolutions(material_id)
             for udim_id in udims:
                 udim_idx = udim_id - 1001
                 udim_stride = 100
                 self.tile_indirection[material_id * udim_stride + udim_idx] = tile_idx
                 tile_idx += 1
 
-                self.high_res_grids.append(
-                    Texture(module.device, self.num_features, high_res, self.wrap(material_id), self.optimizable)
-                )
-                self.low_res_grids.append(
-                    Texture(module.device, self.num_features, low_res, self.wrap(material_id), self.optimizable)
-                )
+                for mip_level in range(self.num_mip_levels):
+                    high_res, low_res = self._grid_resolutions(material_id, mip_level)
+                    self.high_res_grids.append(
+                        Texture(module.device, self.num_features, high_res, self.wrap(material_id), self.optimizable)
+                    )
+                    self.low_res_grids.append(
+                        Texture(module.device, self.num_features, low_res, self.wrap(material_id), self.optimizable)
+                    )
 
         self.tile_indirection_gpu = spy.Tensor.from_numpy(
             module.device, np.array(self.tile_indirection, dtype=np.int32)
@@ -380,7 +393,7 @@ class NtcLatentTexture(IModel):
     def type_name(self) -> str:
         decoder_input_width = 2 * self.num_features + 4 * self.num_pos_enc_waves + 1
         return (
-            f'NtcLatentTexture<{self.num_tiles}, {self.num_features}, '
+            f'NtcLatentTexture<{self.num_tiles}, {self.num_mip_levels}, {self.num_features}, '
             f'{self.num_pos_enc_waves}, {self.num_latents}, {decoder_input_width}, '
             f'{self.decoder.type_name}>'
         )
