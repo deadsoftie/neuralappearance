@@ -12,7 +12,13 @@ import numpy as np
 import slangpy as spy
 from datagen import ReferenceMaterials, create_aux_data_generator
 from falcor2.editor.camera_controller import CameraController
-from model import BcLatentTexture, NeuralModel, NeuralModelCheckpoint, NtcLatentTexture
+from model import (
+    BcLatentTexture,
+    BcLatentTextureHardware,
+    NeuralModel,
+    NeuralModelCheckpoint,
+    NtcLatentTexture,
+)
 from neuralnetworks import utils as nn_utils
 from rendering.hybrid.hybrid_pathtracer import HybridPathTracer
 from rendering.hybrid.resample_helper import ResampleHelper
@@ -129,6 +135,23 @@ def _latent_texture_device_bytes(
                 idx = latent_texture.get_texture_idx(set_idx, tile_idx, mip_level)
                 total += latent_texture.endpoint_textures[idx].buffer.storage.memory_usage.device
                 total += latent_texture.position_textures[idx].buffer.storage.memory_usage.device
+        return total
+
+    if isinstance(latent_texture, BcLatentTextureHardware):
+        # Stage 5's render-only counterpart: one real compressed Texture2D
+        # per (set, tile, mip) rather than a software endpoint/position
+        # pair, so its device footprint is read straight off that texture's
+        # own allocation -- real GPU bytes, smaller than the software
+        # path's float16 buffers by construction (that's the whole point
+        # of a real compressed texture).
+        udim_stride = 100
+        udim_idx = udim_id - 1001
+        tile_idx = latent_texture.tile_indirection[material_id * udim_stride + udim_idx]
+        total = 0
+        for mip_level in range(max(1, num_mip_levels)):
+            for set_idx in range(latent_texture.num_sets):
+                idx = latent_texture.get_texture_idx(set_idx, tile_idx, mip_level)
+                total += latent_texture.grids[idx].memory_usage.device
         return total
 
     total = 0
@@ -976,6 +999,7 @@ class NeuralMaterialVisualizer:
         assets_paths: str,
         compressed_checkpoint: str | None = None,
         compressed_checkpoint_bc7: str | None = None,
+        hardware_sampling: bool = False,
     ):
         super().__init__()
 
@@ -1026,6 +1050,27 @@ class NeuralMaterialVisualizer:
         neural_model.load_checkpoint(model_path)
         aux_trained = neural_model.aux is not None and neural_model.aux.status == 'Done'
         self.neural_model: NeuralModelCheckpoint = neural_model.get_checkpoint()
+
+        # rtbcnam Stage 5 (results/STAGE5.md): swap the trained BcLatentTexture
+        # for its render-only hardware counterpart. NeuralMaterial.configure()
+        # (rendering/neural_material.py) reads latent_texture.type_name fresh
+        # every time it generates the Slang source, so this swap alone is
+        # enough to make the whole visualizer render through
+        # BcLatentTextureHardware's real Texture2D + SampleGrad path -- no
+        # other change needed.
+        if hardware_sampling:
+            if not isinstance(self.neural_model.latent_texture, BcLatentTexture):
+                raise ValueError(
+                    '--hardware-sampling needs a bc_grid checkpoint '
+                    '(model.latents.type == "bc_grid"), got '
+                    f'{type(self.neural_model.latent_texture).__name__}.'
+                )
+            hardware_tex = BcLatentTextureHardware.from_bc_latent_texture(
+                self.neural_model.latent_texture)
+            hardware_tex.initialize(training_module, 'LatentTextureInput')
+            self.neural_model.latent_texture = hardware_tex
+            print(f'Hardware sampling: {len(hardware_tex.grids)} real BC6H '
+                 f'textures, sampled via SampleGrad.')
 
         aux = self.neural_model.aux if aux_trained else None
         self.aux_targets = aux.targets if aux is not None else None
@@ -1704,6 +1749,15 @@ if __name__ == '__main__':
         'panel alongside reference/neural/NTC. Requires --compressed-checkpoint to '
         'also be set -- this adds a panel next to NTC\'s, it does not replace it.',
     )
+    parser.add_argument(
+        '--hardware-sampling', action='store_true',
+        help='Render the bc_grid checkpoint through BcLatentTextureHardware -- '
+        'a real BC6H Texture2D sampled with SampleGrad through a real '
+        'anisotropic SamplerState -- instead of the software BcLatentTexture '
+        'decode path. rtbcnam/PLAN.md Stage 5 (results/STAGE5.md). Needs a '
+        'bc_grid checkpoint; open two visualizer instances, one with this flag '
+        'and one without, on the same checkpoint to compare side by side.',
+    )
     args = parser.parse_args()
 
     if args.compressed_checkpoint_bc7 and not args.compressed_checkpoint:
@@ -1719,5 +1773,6 @@ if __name__ == '__main__':
         args.assets_paths,
         args.compressed_checkpoint,
         args.compressed_checkpoint_bc7,
+        args.hardware_sampling,
     )
     app.main_loop()

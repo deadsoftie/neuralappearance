@@ -60,7 +60,9 @@ public struct NeuralMaterialInstance_<HASH> : IMaterialInstance
     {
         if (NeuralMaterialConfig_<HASH>.cache_latents)
             return this.cached_latents;
-        return config.latents.get_bilinear_stochastic({ material_id, mip_level, si.uv }, texel_sample);
+        const NeuralMaterialGlobals g = g_neural_material_globals;
+        return config.latents.get_bilinear_stochastic(
+            { material_id, mip_level, si.uv, g.duv_dx, g.duv_dy }, texel_sample);
     }
 
     public float3 eval<S : ISampleGenerator>(const SurfaceInteraction si, const float3 wo_ws, inout S sg)
@@ -190,7 +192,8 @@ public struct NeuralMaterial_<HASH> : IMaterial
         // it is net-negative work on backfacing hits. Compile-time branch.
         float[<NUM_LATENTS>] latents = {};
         if (NeuralMaterialConfig_<HASH>.cache_latents)
-            latents = config.latents.get_bilinear_stochastic({ material_id, mip_level, si.uv }, g.texel_sample);
+            latents = config.latents.get_bilinear_stochastic(
+                { material_id, mip_level, si.uv, g.duv_dx, g.duv_dy }, g.texel_sample);
         return NeuralMaterialInstance_<HASH>(material_id, mip_level, g.texel_sample, config_handle, latents);
     }
 };

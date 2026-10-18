@@ -13,6 +13,7 @@ from .bsdf_decoder_flattener import BsdfDecoderFlattener
 from .encoder import Encoder
 from .half_diff_parameterization import HalfDiffParameterization
 from .bc_latent_texture import BcLatentTexture
+from .bc_latent_texture_hardware import BcLatentTextureHardware
 from .latent_texture import LatentTexture, generate_udim_from_encoder
 from .mlp import MLP
 from .neural_material_model import (
@@ -38,6 +39,7 @@ __all__ = [
     'HalfDiffParameterization',
     'InstancedComponent',
     'BcLatentTexture',
+    'BcLatentTextureHardware',
     'LatentTexture',
     'NeuralModel',
     'NeuralModelCheckpoint',

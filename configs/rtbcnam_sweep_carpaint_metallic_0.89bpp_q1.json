@@ -1,0 +1,161 @@
+{
+    "reference_materials": [
+        {
+            "type": "mdl",
+            "path": "vMaterials_2/Paint/Carpaint/Carpaint_Metallic.mdl",
+            "material": "Carpaint_Metallic"
+        }
+    ],
+    "training": {
+        "num_iterations": {
+            "bsdf": 1000,
+            "bsdf_finetuning": 1000,
+            "decoder_repair": 0,
+            "sampler": 500,
+            "aux": 500
+        },
+        "deterministic": true,
+        "optimizer": {
+            "learning_rate": 0.001,
+            "cosine_annealing_scale": 0.01,
+            "gradient_scale": 128.0,
+            "hyperparams": {
+                "beta1": 0.9,
+                "beta2": 0.999,
+                "epsilon": 1e-07,
+                "l2_regularization": 0.0,
+                "ignore_invalid_gradients": true
+            }
+        },
+        "instance_schedule": [
+            64,
+            16,
+            4,
+            1
+        ],
+        "loss_function": {
+            "type": "L1WithPowerLog",
+            "power": 3.0,
+            "epsilon": 0.0001
+        }
+    },
+    "model": {
+        "seed": 0,
+        "latents": {
+            "type": "bc_grid",
+            "num_mip_levels": 1,
+            "num_channels": 12,
+            "normalize": false,
+            "bc_grid": {
+                "feature_resolutions": [
+                    1024,
+                    512,
+                    256,
+                    128
+                ],
+                "bc_format": "bc6h_sfloat",
+                "block_mode": 10,
+                "warmstart_iterations": 200
+            }
+        },
+        "encoder": {
+            "hidden_layers": [
+                64,
+                64,
+                64
+            ],
+            "hidden_activations": "LeakyReLU"
+        },
+        "decoder": {
+            "hidden_layers": [
+                128,
+                64
+            ],
+            "hidden_activations": "SmeLU",
+            "output_activation": {
+                "type": "ScaledSigmoid",
+                "scale": 100000.0
+            },
+            "half_diff_parameterization": "StableRusinkiewicz",
+            "num_shading_frames": 2,
+            "direction_inputs": "WhWdZiZo",
+            "output_clamp": 100.0
+        },
+        "sampler": {
+            "num_specular_lobes": 1,
+            "hidden_layers": [
+                16,
+                16
+            ],
+            "hidden_activations": "LeakyReLU",
+            "weight_cap": 1.0
+        },
+        "aux": {
+            "targets": "ref_diffuse_specular_roughness_normal",
+            "hidden_layers": [
+                16,
+                16
+            ],
+            "hidden_activations": "SmeLU"
+        }
+    },
+    "data_generation": {
+        "seed": 0,
+        "batch_size_schedule": [
+            "1k",
+            "4k",
+            "16k",
+            "64k"
+        ],
+        "num_batches_per_generation": 64,
+        "share_data_between_instances": true,
+        "directional_sampling_strategy": "Balanced_UniformRusinkiewicz_UniformWiImportanceWo",
+        "balanced_directional_sampling_ratio": 0.95,
+        "color_augmentation": {
+            "enabled": true,
+            "num_iterations": 1000,
+            "start_ratio": 1.0,
+            "end_ratio": 0.0
+        },
+        "lod": {
+            "num_prefilter_samples": 64,
+            "num_prefilter_samples_reference": 256
+        }
+    },
+    "checkpoints": {
+        "period": -1,
+        "phases": [
+            "BsdfEncoding",
+            "BsdfDirectOptimization",
+            "Sampler",
+            "Aux"
+        ],
+        "rendering": {
+            "spp": 16,
+            "max_depth": 10,
+            "save_reference": true,
+            "save_neural": true,
+            "all_udims": false,
+            "format": "exr"
+        },
+        "bsdf_plots": {
+            "save": true,
+            "num_uvs": 5,
+            "num_samples": 1000,
+            "axes": [
+                "log"
+            ],
+            "resolution": 450,
+            "udim_id": -1
+        },
+        "model": {
+            "save_images": true,
+            "save_params": true
+        },
+        "loss_plots": {
+            "save": true
+        },
+        "validation_losses": false
+    },
+    "_generated_by": "rtbcnam/harness/run_sweep.py -- carpaint_metallic @ 0.89bpp (feature_resolutions=[1024, 512, 256, 128], num_latents=12, num_mip_levels=1), from rtbcnam_template.json. QUICK LOOK at iteration_scale=0.01 ({'bsdf': 1000, 'bsdf_finetuning': 1000, 'decoder_repair': 0, 'sampler': 500, 'aux': 500}) -- directional only, NOT a converged result, do not quote as one."
+}

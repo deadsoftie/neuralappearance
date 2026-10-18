@@ -5,6 +5,7 @@
 __exported import base_types;
 __exported import aux_decoder;
 __exported import bc_latent_texture;
+__exported import bc_latent_texture_hardware;
 __exported import bsdf_decoder_flattener;
 __exported import encoder;
 __exported import half_diff_parameterization;
@@ -53,6 +54,28 @@ float[NumLatents] eval_latent_texture_bilinear_stochastic<
 )
 {
     return latent_texture.get_bilinear_stochastic({ material_id, int(mip_level), uv }, sample);
+}
+
+// Same shape as eval_latent_texture_bilinear_stochastic, but exposes the UV
+// footprint derivatives explicitly instead of defaulting them to zero --
+// needed to exercise a hardware latent texture's real anisotropic filtering
+// (model/bc_latent_texture_hardware.slang, rtbcnam/PLAN.md Stage 5) from
+// Python, since the software latent types ignore these fields entirely and
+// every other generic eval wrapper here leaves them at LatentTextureInput's
+// default.
+float[NumLatents] eval_latent_texture_bilinear_with_footprint<
+    int NumLatents,
+    LatentTexture : ILatentTexture<NumLatents>
+>(
+    LatentTexture latent_texture,
+    int material_id,
+    int mip_level,
+    float2 uv,
+    float2 duv_dx,
+    float2 duv_dy
+)
+{
+    return latent_texture.get_bilinear({ material_id, mip_level, uv, duv_dx, duv_dy });
 }
 
 float[3] eval_bsdf_decoder<

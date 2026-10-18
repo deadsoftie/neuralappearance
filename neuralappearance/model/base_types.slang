@@ -39,6 +39,16 @@ struct LatentTextureInput : IDifferentiable
     int material_id;
     int mip_level;
     float2 uv;
+    // Screen-space UV footprint derivatives, for a hardware-texture latent
+    // (rtbcnam/PLAN.md Stage 5, model/bc_latent_texture_hardware.slang) to
+    // drive real anisotropic filtering via SampleGrad. Defaulted to zero so
+    // every pre-existing 3-field call site -- training, validation, the
+    // dense/NTC software paths, which all ignore this -- keeps compiling
+    // unchanged; only rendering/neural_material.slang's two real shading
+    // call sites, which already compute these for the mip Russian-roulette
+    // pick, pass real values.
+    float2 duv_dx = float2(0.f);
+    float2 duv_dy = float2(0.f);
 }
 
 
