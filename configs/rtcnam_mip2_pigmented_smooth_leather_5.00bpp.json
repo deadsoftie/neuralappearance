@@ -55,7 +55,11 @@
             "ntc_grid": {
                 "grid_size_scale": 4,
                 "num_features": 16,
-                "num_pos_enc_waves": 3,
+                // 1, matching configs/rtcnam_template.json -- the only value
+                // where no positional-encoding octave exceeds the grid's own
+                // Nyquist limit. 3 produces a visible grid lattice and cost
+                // 17.7 dB at 10.0bpp. See that file for the measured series.
+                "num_pos_enc_waves": 1,
                 "decoder_hidden_layers": [
                     64,
                     48,

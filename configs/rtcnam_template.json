@@ -84,7 +84,37 @@
             "ntc_grid": {
                 "grid_size_scale": 6,
                 "num_features": 8,
-                "num_pos_enc_waves": 3,
+                // 1, not RTXNTC's 3. Measured, not tuned: this is the only
+                // value at which no positional-encoding octave exceeds the
+                // feature grid's own Nyquist limit, at every preset.
+                //
+                // encode_position builds frac() sawtooths at
+                // uv * grid_res * 0.5, doubling per octave, so octave 0 sits
+                // exactly at the grid's Nyquist (its period is two grid
+                // cells) and every further octave is 2x past it. An octave
+                // the grid cannot vary at is an octave the grid cannot
+                // locally modulate, so the same sawtooth gets stamped
+                // identically into every cell -- a globally coherent lattice
+                // that cannot adapt to the material. Confirmed spectrally
+                // (rtcnam/harness/latent_field_probe.py) and visually.
+                //
+                // pigmented_smooth_leather 10.0bpp, iteration_scale 0.1:
+                //   waves=0 -> 36.18 dB   (no encoding at all)
+                //   waves=1 -> 36.23 dB   top octave 1024 c/UV, at grid Nyquist
+                //   waves=2 -> 23.52 dB   top octave 2048 c/UV, 2x past it
+                //   waves=3 -> 18.53 dB   top octave 4096 c/UV, 4x past it
+                // and +23.1 dB at 20.0bpp. Costs nothing at 1.11bpp
+                // (36.04 vs 36.10, inside noise), because there every octave
+                // still lands below the 4096^2 reference texture's own 2048
+                // c/UV limit, so what it fabricates at least falls in a band
+                // where real detail exists.
+                //
+                // This also removes the rate-distortion inversion: with
+                // waves=3 quality got WORSE as bitrate rose (36.05 -> 13.14
+                // from 1.11 to 20.0bpp), because a finer grid pushes the
+                // encoding into higher, more fabricated frequencies. See
+                // rtcnam/results/MORNING_REPORT.md.
+                "num_pos_enc_waves": 1,
                 "decoder_hidden_layers": [
                     64,
                     48,

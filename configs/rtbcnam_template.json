@@ -1,0 +1,272 @@
+// rtbcnam sweep template -- the base config rtbcnam/harness/run_sweep.py
+// clones for every (material, BC6H pyramid preset, mips) combo.
+// build_config() overwrites reference_materials, latents.num_mip_levels,
+// latents.num_channels and latents.bc_grid.feature_resolutions per combo, and
+// --iteration-scale rewrites the iteration counts; everything else here is the
+// recipe under test and is shared by every run in a sweep.
+//
+// NAMED DELIBERATELY OUTSIDE THE rtbcnam_sweep_* NAMESPACE. The per-combo
+// configs the sweep generates are rtbcnam_sweep_<combo>.json, so a template
+// called rtbcnam_sweep_template.json would sit inside the glob used to clean
+// those up. That exact mistake deleted rtcnam's template once. run_sweep.py
+// also fails fast with a clear message if this file is missing.
+//
+// Derived from configs/rtcnam_template.json. Full evidence for every
+// inherited value, and the reason for every omission, is in
+// rtbcnam/INHERITED_FINDINGS.md. Summary of the differences:
+//
+//   KEPT, because measured load-bearing in rtcnam:
+//     - model.decoder.hidden_layers [128,64]. Worth ~10.6 dB at 10.0bpp
+//       (SIMPLIFICATION_PLAN.md Stage B: stripping it cost 36.05 -> 23.64).
+//     - model.decoder.output_clamp 100.0 and model.sampler.weight_cap 1.0.
+//       Together ~1.8 dB on leather and ~18 dB on carpaint, with fireflies
+//       returning when stripped (Stage C: carpaint 25.39 -> 7.37).
+//     - model.latents.normalize false. MANDATORY, not a preference: train.py
+//       asserts it for any path running direct optimization, and the four
+//       bounding variants behind that assert are documented in
+//       ntc_latent_texture.slang. Do not re-run them.
+//     - data_generation.batch_size_schedule as square numbers. "2k"/"8k"
+//       fail at config load with "Batch size must be a square number".
+//
+//   DROPPED, because this architecture has no equivalent:
+//     - num_pos_enc_waves and all of encode_position. There is no positional
+//       encoding here, so the grid-lattice failure mode cannot occur. The
+//       analogous risk is a 4-pixel BLOCK lattice from a poor per-block
+//       line-segment fit; rtbcnam/harness/latent_field_probe.py looks for it.
+//     - quantize{} and training.num_iterations.decoder_repair. BC6H
+//       quantization happens inside the differentiable forward pass, so there
+//       is no post-training rounding step to absorb. decoder_repair is 0 as a
+//       PREDICTION; PLAN.md Stage 3 checks it, and the check must be run with
+//       repair OFF (rtcnam measured quantization "free" with repair ON, which
+//       is a different claim).
+//     - coverage_penalty, latent_smoothness, freeze_decoder_during_diropt.
+//       Already inert by configuration in rtcnam (weight 0, weight 0, False)
+//       and never enabled in any reported run. train.py reads all three with
+//       .get() defaults, so omitting them changes nothing.
+{
+    "reference_materials": [
+        {
+            "type": "mdl",
+            "path": "vMaterials_2/Leather/Pigmented_Smooth_Leather.mdl",
+            "material": "Pigmented_Smooth_Leather"
+        }
+    ],
+    "training": {
+        "num_iterations": {
+            "bsdf": 100000,
+            "bsdf_finetuning": 100000,
+            // Zero on purpose, and it is a claim rather than a default. See
+            // the header note and PLAN.md Stage 3.
+            "decoder_repair": 0,
+            "sampler": 50000,
+            "aux": 50000
+        },
+        "deterministic": true,
+        "optimizer": {
+            "learning_rate": 0.001,
+            "cosine_annealing_scale": 0.01,
+            "gradient_scale": 128.0,
+            "hyperparams": {
+                "beta1": 0.9,
+                "beta2": 0.999,
+                "epsilon": 1e-07,
+                "l2_regularization": 0.0,
+                "ignore_invalid_gradients": true
+            }
+        },
+        "instance_schedule": [
+            64,
+            16,
+            4,
+            1
+        ],
+        "loss_function": {
+            "type": "L1WithPowerLog",
+            "power": 3.0,
+            "epsilon": 0.0001
+        }
+    },
+    "model": {
+        "seed": 0,
+        "latents": {
+            "type": "bc_grid",
+            // RTNAM's OUTER Russian-roulette mip selection, which is
+            // orthogonal to the BC6H textures' own hardware mip chains. Those
+            // chains always exist, because hardware trilinear filtering is one
+            // of the three reasons this architecture exists.
+            "num_mip_levels": 1,
+            // 4 texture sets x 3 channels. DERIVED from
+            // bc_grid.feature_resolutions by run_sweep.build_config(), not read
+            // from here -- a stale value would be a silent Python/Slang layout
+            // mismatch. Present only so the template parses standalone.
+            //
+            // This is 12, not RTCNAM's 8, and the difference is structural
+            // rather than tuned: BC6H is RGB-only, so channel count and pyramid
+            // depth move together. It is also a real capacity increase, which
+            // partly offsets the 3-channels-per-texture constraint.
+            "num_channels": 12,
+            "normalize": false,
+            "bc_grid": {
+                // BCf's Ttheta0..Ttheta3 structure
+                // (docs/deep-dives/dd1-block-compressed-features.md, table 1).
+                // Overwritten per preset; this is the `3.54` row.
+                "feature_resolutions": [
+                    2048,
+                    1024,
+                    512,
+                    256
+                ],
+                // The latent is signed: dense RTNAM's measured range is about
+                // [-0.79, 0.89]. bc6h_sfloat handles that directly. The
+                // alternative, bc6h_ufloat plus a per-texture offset and scale,
+                // already exists and is tested as
+                // latent_bc7_roundtrip.py's normalize_per_channel, so it is the
+                // fallback if sfloat misbehaves.
+                "bc_format": "bc6h_sfloat",
+                // BC6H mode 11: ONE subset, no partition mask, 4-bit indices,
+                // 16-bit endpoints.
+                //
+                // This is the one real simplification against BCf's published
+                // recipe, and it is deliberate. BCf must fix each block's
+                // partition before its main training phase, because partition
+                // choice is discrete and unreachable by gradient descent (a 5k
+                // unconstrained warmup, one real BC6 compress to pick
+                // partitions, then 200k constrained iterations). dd2 records
+                // the same obstacle for NTBC, whose index-derivation trick
+                // assumes BC1/BC4's single two-endpoint palette and whose
+                // authors twice name BC6H/BC7 extension as unsolved.
+                //
+                // Mode 11 has no partition, so there is no discrete choice and
+                // the forward pass is differentiable from iteration zero. It
+                // also has the better index precision of the two BC6H families
+                // (16 levels against the two-subset modes' 8), which suits a
+                // smooth latent field. Cost: one line segment must cover all
+                // 16 pixels, which is worse for blocks containing a real edge.
+                //
+                // Two-subset modes are PLAN.md Stage 6, gated on Stage 3
+                // missing its quality target.
+                "block_mode": 11,
+                // Regress BC-parameterized features against the frozen
+                // encoder's output field before direct optimization fine-tunes
+                // features and BsdfDecoder jointly. Same count and same role as
+                // rtcnam's, which is 20k.
+                "warmstart_iterations": 20000
+            }
+        },
+        "encoder": {
+            "hidden_layers": [
+                64,
+                64,
+                64
+            ],
+            "hidden_activations": "LeakyReLU"
+        },
+        "decoder": {
+            // Load-bearing, ~10.6 dB. See the header note.
+            //
+            // One caveat specific to rtbcnam: that figure was measured against
+            // num_latents 8, and this architecture feeds 12. Worth one
+            // `--set model.decoder.hidden_layers=[160,80]` probe at Stage 3,
+            // not a full axis. Stay under 256 per layer either way: [256,128]
+            // fails at model construction with
+            // `getCooperativeVectorMatrixSize ... SLANG_E_INVALID_ARG`. The
+            // coopvec limit is width, not depth, so [128,128,64] builds fine.
+            "hidden_layers": [
+                128,
+                64
+            ],
+            "hidden_activations": "SmeLU",
+            "output_activation": {
+                "type": "ScaledSigmoid",
+                "scale": 100000.0
+            },
+            "half_diff_parameterization": "StableRusinkiewicz",
+            "num_shading_frames": 2,
+            "direction_inputs": "WhWdZiZo",
+            // Bounds a single BSDF evaluation. Keep.
+            "output_clamp": 100.0
+        },
+        "sampler": {
+            "num_specular_lobes": 1,
+            "hidden_layers": [
+                16,
+                16
+            ],
+            "hidden_activations": "LeakyReLU",
+            // Bounds the indirect-bounce importance weight (bsdf / sampler
+            // pdf), which output_clamp alone does not: a clamped bsdf over a
+            // near-zero pdf still explodes. Measured inert on leather and
+            // worth ~18 dB together with output_clamp on carpaint, whose
+            // procedural position-hashed flake layer is what both were built
+            // for. Keep.
+            "weight_cap": 1.0
+        },
+        "aux": {
+            "targets": "ref_diffuse_specular_roughness_normal",
+            "hidden_layers": [
+                16,
+                16
+            ],
+            "hidden_activations": "SmeLU"
+        }
+    },
+    "data_generation": {
+        "seed": 0,
+        // Square numbers only. "2k"/"8k" fail at config load.
+        "batch_size_schedule": [
+            "1k",
+            "4k",
+            "16k",
+            "64k"
+        ],
+        "num_batches_per_generation": 64,
+        "share_data_between_instances": true,
+        "directional_sampling_strategy": "Balanced_UniformRusinkiewicz_UniformWiImportanceWo",
+        "balanced_directional_sampling_ratio": 0.95,
+        "color_augmentation": {
+            "enabled": true,
+            "num_iterations": 100000,
+            "start_ratio": 1.0,
+            "end_ratio": 0.0
+        },
+        "lod": {
+            "num_prefilter_samples": 64,
+            "num_prefilter_samples_reference": 256
+        }
+    },
+    "checkpoints": {
+        "period": -1,
+        "phases": [
+            "BsdfEncoding",
+            "BsdfDirectOptimization",
+            "Sampler",
+            "Aux"
+        ],
+        "rendering": {
+            "spp": 16,
+            "max_depth": 10,
+            "save_reference": true,
+            "save_neural": true,
+            "all_udims": false,
+            "format": "exr"
+        },
+        "bsdf_plots": {
+            "save": true,
+            "num_uvs": 5,
+            "num_samples": 1000,
+            "axes": [
+                "log"
+            ],
+            "resolution": 450,
+            "udim_id": -1
+        },
+        "model": {
+            "save_images": true,
+            "save_params": true
+        },
+        "loss_plots": {
+            "save": true
+        },
+        "validation_losses": false
+    }
+}
