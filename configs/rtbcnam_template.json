@@ -123,29 +123,41 @@
                 // latent_bc7_roundtrip.py's normalize_per_channel, so it is the
                 // fallback if sfloat misbehaves.
                 "bc_format": "bc6h_sfloat",
-                // BC6H mode 11: ONE subset, no partition mask, 4-bit indices,
-                // 16-bit endpoints.
+                // BC6H mode 10: ONE subset, no partition mask, 4-bit
+                // indices, and BOTH endpoints stored absolutely at 10 bits.
                 //
-                // This is the one real simplification against BCf's published
-                // recipe, and it is deliberate. BCf must fix each block's
+                // The one-subset family is the point: BCf must fix each block's
                 // partition before its main training phase, because partition
                 // choice is discrete and unreachable by gradient descent (a 5k
-                // unconstrained warmup, one real BC6 compress to pick
-                // partitions, then 200k constrained iterations). dd2 records
-                // the same obstacle for NTBC, whose index-derivation trick
-                // assumes BC1/BC4's single two-endpoint palette and whose
-                // authors twice name BC6H/BC7 extension as unsolved.
+                // unconstrained warmup, one real BC6 compress, then 200k
+                // constrained iterations). dd2 records the same obstacle for
+                // NTBC, whose index-derivation trick assumes BC1/BC4's single
+                // two-endpoint palette and whose authors twice name BC6H/BC7
+                // extension as unsolved. No partition means nothing discrete to
+                // choose and a forward pass differentiable from iteration zero.
                 //
-                // Mode 11 has no partition, so there is no discrete choice and
-                // the forward pass is differentiable from iteration zero. It
-                // also has the better index precision of the two BC6H families
-                // (16 levels against the two-subset modes' 8), which suits a
-                // smooth latent field. Cost: one line segment must cover all
-                // 16 pixels, which is worse for blocks containing a real edge.
+                // Mode 10 rather than mode 11, and this was a CORRECTION made
+                // at Stage 1 (rtbcnam/results/STAGE1.md). Mode 11 stores a base
+                // plus a 9-bit signed delta at 11-bit precision: finer endpoint
+                // placement, but endpoint separation capped at 256 of 1024
+                // endpoint units. Measured on a 4x4 block holding a ramp across
+                // [-0.6, 0.7]: the delta needed 967 endpoint units and could
+                // supply 256, so mode 11's ceiling was 7.67 dB against mode
+                // 10's 9.44 dB. That is a representability cliff, not a quality
+                // difference -- no amount of training recovers from it.
                 //
-                // Two-subset modes are PLAN.md Stage 6, gated on Stage 3
-                // missing its quality target.
-                "block_mode": 11,
+                // On full 256x256 fields the two modes are within 0.1 dB on
+                // smooth content, so do not expect this to show up as average
+                // quality. Mode 10's wins are on high-contrast content
+                // (+1.45 dB on a hard-edged field, +0.79 dB on noise), which is
+                // what carpaint_metallic's position-hashed flake layer is.
+                //
+                // Cost of one subset either way: worse than the two-subset
+                // modes where a block straddles a real discontinuity, measured
+                // at about 8.6 dB on a hard-edged field. That is PLAN.md Stage
+                // 6, gated on Stage 3 missing its quality target AND the field
+                // probe showing energy at the block rate.
+                "block_mode": 10,
                 // Regress BC-parameterized features against the frozen
                 // encoder's output field before direct optimization fine-tunes
                 // features and BsdfDecoder jointly. Same count and same role as

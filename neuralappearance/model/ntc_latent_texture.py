@@ -585,6 +585,29 @@ class NtcLatentTexture(IModel):
             for (tex, _), bitmap in zip(exr_load_items, bitmaps, strict=True):
                 tex.load_from_bitmap(bitmap)
 
+        # All-or-nothing, enforced rather than assumed. A checkpoint with SOME
+        # grids packed and some left as EXR (an interrupted save, a partially
+        # copied directory) would otherwise set `self.quantized = True` while
+        # the EXR-loaded grids kept their default range of (0.0, 0.0). The next
+        # `save_checkpoint_images()` would then pack those grids with a zero
+        # span, and `_pack_quantized_grid()` maps a zero span to all-zero
+        # indices -- silently destroying real trained data on disk, with no
+        # error and no obvious symptom until the render came back wrong.
+        #
+        # Failing here instead costs a clear message and loses nothing: the
+        # files on disk are still intact at this point.
+        total_grids = len(self.high_res_grids) + len(self.low_res_grids)
+        packed_count = sum(
+            1 for lo, hi in high_res_ranges + low_res_ranges if (lo, hi) != (0.0, 0.0)
+        )
+        if quantized_any and packed_count != total_grids:
+            raise ValueError(
+                f'Mixed checkpoint in {folder}: {packed_count} of {total_grids} '
+                'grids are in the packed 4-bit format and the rest are EXR. '
+                'Saving from this state would pack the EXR grids with a zero '
+                'range and destroy them. Restore a complete checkpoint.'
+            )
+
         self.quantized = quantized_any
         self.quantize_bits = bits_seen
         self.quantize_high_res_ranges = high_res_ranges
