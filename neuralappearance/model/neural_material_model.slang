@@ -4,6 +4,7 @@
 // clang-format off
 __exported import base_types;
 __exported import aux_decoder;
+__exported import bc_latent_texture;
 __exported import bsdf_decoder_flattener;
 __exported import encoder;
 __exported import half_diff_parameterization;

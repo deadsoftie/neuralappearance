@@ -32,7 +32,7 @@ from datagen import (
     SamplerDataGenerator,
     create_aux_data_generator,
 )
-from model import NeuralModel, NtcLatentTexture
+from model import BcLatentTexture, NeuralModel, NtcLatentTexture
 from rendering import Renderer
 from rendering.pathtracer_helpers import create_testscene
 from slangpy.core.native import Shape
@@ -853,7 +853,13 @@ def training_main(args) -> None:
     )
 
     training_bsdf_encoding(job)
-    if isinstance(neural_model.latent_texture.instances[0], NtcLatentTexture):
+    # Both compressed latent types need the same warm start: regress the
+    # compressed representation against the frozen encoder's output field
+    # before direct optimization fine-tunes it against the real BSDF loss.
+    # `train_ntc_warmstart` in train.slang is generic over
+    # `ILatentTexture<NumLatents>`, so one kernel serves both.
+    if isinstance(neural_model.latent_texture.instances[0],
+                  (NtcLatentTexture, BcLatentTexture)):
         # rtcnam/PLAN.md: warm-start the grid + decode MLP to reproduce the
         # just-trained encoder's output field before direct optimization
         # (next) fine-tunes grid, decode MLP, and BsdfDecoder jointly
@@ -1019,14 +1025,20 @@ def training_ntc_warmstart(job: TrainingJob) -> None:
 
     print()
 
-    assert isinstance(neural_model.latent_texture.instances[0], NtcLatentTexture)
+    latent_texture = neural_model.latent_texture.instances[0]
+    assert isinstance(latent_texture, (NtcLatentTexture, BcLatentTexture))
     assert neural_model.encoder is not None and neural_model.encoder.status == 'Done', (
-        'NTC grid warm-start requires a already-trained encoder to regress against.'
+        'Compressed-latent warm-start requires an already-trained encoder to '
+        'regress against.'
     )
 
-    num_iterations = config['model']['latents']['ntc_grid'].get('warmstart_iterations', 20000)
+    # The two compressed types keep their settings under their own config key.
+    latents_type = config['model']['latents'].get('type', 'dense')
+    num_iterations = config['model']['latents'][latents_type].get(
+        'warmstart_iterations', 20000)
     if num_iterations == 0:
-        print('No ntc_grid warmstart iterations configured, skipping "training_ntc_warmstart()".')
+        print(f'No {latents_type} warmstart iterations configured, '
+              'skipping "training_ntc_warmstart()".')
         return
 
     lr_scheduler = CosineAnnealingLRScheduler(
@@ -1041,8 +1053,8 @@ def training_ntc_warmstart(job: TrainingJob) -> None:
     neural_model.start_training(neural_model.latent_texture)
 
     assert neural_model.num_instances == 1, (
-        'NTC grid warm-start expects a single pruned encoder/decoder instance, '
-        'same as any post-encoding finetuning phase.'
+        'Compressed-latent warm-start expects a single pruned encoder/decoder '
+        'instance, same as any post-encoding finetuning phase.'
     )
 
     train_ntc_warmstart = module.train_ntc_warmstart.as_func().map(

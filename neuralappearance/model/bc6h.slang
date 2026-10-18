@@ -277,10 +277,23 @@ int bc6h_quantize_endpoint(float endpoint, bool is_signed)
     return int(clamp(round(endpoint), lo, hi));
 }
 
-int bc6h_quantize_index(float position)
+// The real format gives every texel a 4-bit index (16 levels) EXCEPT the
+// block's anchor -- the texel at local raster position 0 (top-left of the
+// 4x4 block) -- which stores only 3 bits (0-7) because the format reuses its
+// top bit to save one bit per block; hardware reads that stored value and
+// implicitly zero-extends it, so the anchor can only reach the LOWER half of
+// the same 16-entry weight table every other texel indexes into.
+//
+// `BC6H_MODE10_INDEX_LEVELS` (15) is wrong for the anchor specifically. Using
+// it there was a real gap between this simulation and the hardware format,
+// found at Stage 4 (`rtbcnam/results/STAGE4.md`): measured on a real trained
+// checkpoint, 35.55% of ALL blocks had an anchor needing an index >= 8, worst
+// case 15 -- more than half that texel's representable range, not a rare
+// edge case. `is_anchor` must be `true` for exactly one texel per 4x4 block.
+int bc6h_quantize_index(float position, bool is_anchor)
 {
-    return int(clamp(round(position * float(BC6H_MODE10_INDEX_LEVELS)),
-                     0.f, float(BC6H_MODE10_INDEX_LEVELS)));
+    let levels = is_anchor ? 7.f : float(BC6H_MODE10_INDEX_LEVELS);
+    return int(clamp(round(position * levels), 0.f, levels));
 }
 
 // Sign-extend the low `BC6H_MODE10_PRECISION` bits. Idempotent for values
@@ -315,9 +328,9 @@ float bc6h_decode_channel_exact(int endpoint0, int endpoint1, int index, bool is
 // constraint on what the latent can represent, not a simplification here.
 [Differentiable]
 float3 bc6h_decode_mode10(float3 endpoint0, float3 endpoint1, float position,
-                          no_diff bool is_signed)
+                          no_diff bool is_signed, no_diff bool is_anchor)
 {
-    let index = bc6h_quantize_index(position);
+    let index = bc6h_quantize_index(position, is_anchor);
     float3 result;
     [ForceUnroll]
     for (int c = 0; c < 3; ++c)
@@ -341,13 +354,29 @@ float3 bc6h_decode_mode10(float3 endpoint0, float3 endpoint1, float position,
 //                          dv/dw    = (b-a)/64
 //   a   = 64*ep0 + 32,     da/dep0  = 64 * s0
 //   b   = 64*ep1 + 32,     db/dep1  = 64 * s1
-//   w   = W(round(p*15)),  dw/dp    = (64/15) * 15 = 64
+//   w   = W(round(p*15)),  dw/dp    = (64/15) * 15 = 64        [non-anchor]
 //
-// The 64s cancel, leaving:
+// The endpoint gradients never depend on how many INDEX LEVELS exist --
+// `da/dep0`/`db/dep1` are always exactly 64, regardless of anchor status --
+// so `d_endpoint0`/`d_endpoint1` are identical in both cases:
 //
 //   dout/dep0 = dout/dV * finish_scale * (64 - w) * s0
 //   dout/dep1 = dout/dV * finish_scale * w * s1
-//   dout/dp   = dout/dV * finish_scale * (b - a)
+//
+// `dout/dp`, however, DOES depend on it, through `dw/dp`. The weight table's
+// TOP reachable value is what the 64 in the non-anchor case actually is: at
+// p=1, index=15, weight=64, so the continuous map p->w spans [0,64] and
+// dw/dp=64 drops the "/64" from `dv/dw` entirely (`(b-a)/64 * 64 = b-a`,
+// "the 64s cancel"). At the ANCHOR (see `bc6h_quantize_index`), p=1 maps to
+// index=7, weight=30 (`BC6H_WEIGHT4[7]`) -- the map spans only [0,30], so
+// dw/dp=30, and the cancellation is partial: `(b-a)/64 * 30 = (b-a) * 30/64`.
+// Getting this wrong would not break correctness in any way a forward-value
+// test could catch -- it would only make the anchor's position gradient
+// about 2.1x too large, a purely-magnitude error in exactly the texel this
+// file exists to treat specially. The anchor's own top-weight VALUE is
+// looked up live via `BC6H_WEIGHT4[quantize_index(1.0, true)]` rather than
+// hand-copied as a literal 30, so a future change to the anchor's level
+// count cannot silently leave this scale stale.
 //
 // Unlike mode 11 the two endpoints are independent -- there is no delta
 // transform, so neither collects the other's path. `position` accumulates over
@@ -358,11 +387,17 @@ void bc6h_decode_mode10_bwd(
     inout DifferentialPair<float3> endpoint1,
     inout DifferentialPair<float> position,
     bool is_signed,
+    bool is_anchor,
     float3 d_out)
 {
-    let index = bc6h_quantize_index(position.p);
+    let index = bc6h_quantize_index(position.p, is_anchor);
     let weight = BC6H_WEIGHT4[index];
     let finish_scale = bc6h_finish_scale(is_signed);
+    // See the derivation above: 1.0 when the weight table's reachable top is
+    // 64 (non-anchor), BC6H_WEIGHT4[7]/64.0 (0.46875) at the anchor.
+    let position_scale = is_anchor
+        ? float(BC6H_WEIGHT4[bc6h_quantize_index(1.f, true)]) / 64.f
+        : 1.f;
 
     float3 d_endpoint0 = float3(0.f);
     float3 d_endpoint1 = float3(0.f);
@@ -391,7 +426,7 @@ void bc6h_decode_mode10_bwd(
 
         d_endpoint0[c] = d_value * float(64 - weight) * s0;
         d_endpoint1[c] = d_value * float(weight) * s1;
-        d_position += d_value * float(b - a);
+        d_position += d_value * float(b - a) * position_scale;
     }
 
     endpoint0 = diffPair(endpoint0.p, endpoint0.d + d_endpoint0);

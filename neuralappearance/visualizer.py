@@ -12,7 +12,7 @@ import numpy as np
 import slangpy as spy
 from datagen import ReferenceMaterials, create_aux_data_generator
 from falcor2.editor.camera_controller import CameraController
-from model import NeuralModel, NeuralModelCheckpoint, NtcLatentTexture
+from model import BcLatentTexture, NeuralModel, NeuralModelCheckpoint, NtcLatentTexture
 from neuralnetworks import utils as nn_utils
 from rendering.hybrid.hybrid_pathtracer import HybridPathTracer
 from rendering.hybrid.resample_helper import ResampleHelper
@@ -114,6 +114,22 @@ def _latent_texture_device_bytes(
         hi = latent_texture.high_res_grids[tile_idx]
         lo = latent_texture.low_res_grids[tile_idx]
         return hi.buffer.storage.memory_usage.device + lo.buffer.storage.memory_usage.device
+
+    if isinstance(latent_texture, BcLatentTexture):
+        # bc_grid stores `num_sets` independent (endpoints, positions)
+        # texture PAIRS per (tile, mip) rather than one texture per mip, so
+        # there is no single `.texture()` to call -- sum every set's pair,
+        # same tile_idx lookup as LatentTexture._texture_idx.
+        udim_stride = 100
+        udim_idx = udim_id - 1001
+        tile_idx = latent_texture.tile_indirection[material_id * udim_stride + udim_idx]
+        total = 0
+        for mip_level in range(max(1, num_mip_levels)):
+            for set_idx in range(latent_texture.num_sets):
+                idx = latent_texture.get_texture_idx(set_idx, tile_idx, mip_level)
+                total += latent_texture.endpoint_textures[idx].buffer.storage.memory_usage.device
+                total += latent_texture.position_textures[idx].buffer.storage.memory_usage.device
+        return total
 
     total = 0
     found_any = False

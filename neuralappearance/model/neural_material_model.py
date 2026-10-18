@@ -18,6 +18,7 @@ from .aux_decoder import AuxDecoder
 from .bsdf_decoder import BsdfDecoder
 from .encoder import Encoder
 from .latent_texture import LatentTexture
+from .bc_latent_texture import BcLatentTexture
 from .ntc_latent_texture import NtcLatentTexture
 from .sampler import Sampler
 
@@ -25,7 +26,7 @@ from .sampler import Sampler
 # than through a `children()` model, so `InstancedComponent` special-cases
 # either one the same way everywhere it needs to tell a latent-texture
 # component apart from a decoder/encoder/sampler/aux candidate pool.
-LatentTextureTypes = (LatentTexture, NtcLatentTexture)
+LatentTextureTypes = (LatentTexture, NtcLatentTexture, BcLatentTexture)
 
 if TYPE_CHECKING:
     from datagen import ReferenceMaterials
@@ -146,9 +147,13 @@ class NeuralModel:
         # `"dense"` (default) is RTNAM's own per-texel buffer, unchanged.
         # `"ntc_grid"` (rtcnam/PLAN.md) swaps in a pair of lower-resolution
         # feature grids decoded by a small MLP, matching NVIDIA's shipped
-        # RTXNTC SDK's grid-shape/quantization recipe; every downstream
-        # consumer (decoders, training kernels, renderer, visualizer) goes
-        # through the same `ILatentTexture` interface either way.
+        # RTXNTC SDK's grid-shape/quantization recipe.
+        # `"bc_grid"` (rtbcnam/PLAN.md) swaps in BC6H-shaped feature textures
+        # whose sampled values ARE the latent -- no decode MLP at all, so
+        # nothing diverges per lane and hardware filtering comes for free.
+        # Every downstream consumer (decoders, training kernels, renderer,
+        # visualizer) goes through the same `ILatentTexture` interface in all
+        # three cases.
         latents_config = self.config['model']['latents']
         latents_type = latents_config.get('type', 'dense')
         if latents_type == 'dense':
@@ -200,6 +205,21 @@ class NeuralModel:
                 num_mip_levels=latents_config['num_mip_levels'],
                 optimizable=False,
                 decoder_quantization=decoder_quantization,
+            )
+        elif latents_type == 'bc_grid':
+            bc_config = latents_config['bc_grid']
+            # Validation lives in `BcLatentTexture.__init__` so it fires at
+            # model construction rather than hours into a run -- the same
+            # reasoning as the `ntc_grid` quantize-bits check above.
+            latent_texture = BcLatentTexture.from_reference_materials(
+                reference_materials,
+                latents_config['num_channels'],
+                bc_config['feature_resolutions'],
+                bc_config.get('bc_format', 'bc6h_sfloat'),
+                bc_config.get('block_mode', 10),
+                num_mip_levels=latents_config['num_mip_levels'],
+                optimizable=False,
+                init_amplitude=bc_config.get('init_amplitude', 0.1),
             )
         else:
             raise ValueError(f'Unknown model.latents.type: {latents_type!r}')
