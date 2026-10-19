@@ -4,3 +4,10 @@ __pycache__/
 .slang-replays/
 .venv/
 .vscode/
+# Per-combo configs run_sweep.py (rtbcnam/rtcnam) regenerates every
+# invocation from the matching *_template.json -- pure byproducts, zero
+# downstream dependency (each checkpoint carries its own config.json copy
+# under .jobs/, already ignored above). Found accumulating as repo clutter
+# (46 untracked + several already-committed files) during RTBCNAM's
+# architecture-finalization review.
+configs/*_sweep_*.json

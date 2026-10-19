@@ -141,7 +141,8 @@ class BcLatentTexture(IModel):
                 f'model.latents.bc_grid.block_mode must be one of '
                 f'{_SUPPORTED_BLOCK_MODES}, got {block_mode}. Mode 10 is the '
                 'only one bc6h.slang implements; the two-subset modes need a '
-                'partition search and are rtbcnam/PLAN.md Stage 6.'
+                'partition search and were never built because Stage 3\'s '
+                'quality gate cleared without them (rtbcnam/PLAN.md).'
             )
         if not feature_resolutions:
             raise ValueError('model.latents.bc_grid.feature_resolutions is empty.')

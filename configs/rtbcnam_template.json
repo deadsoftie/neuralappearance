@@ -5,6 +5,34 @@
 // --iteration-scale rewrites the iteration counts; everything else here is the
 // recipe under test and is shared by every run in a sweep.
 //
+// THIS FILE'S decoder.hidden_layers ([128,64]) AND bsdf_finetuning (100000)
+// ARE DELIBERATELY NOT the current recommendation. `results/CAPACITY_SWEEP.md`
+// and `results/ITERATION_SWEEP.md` found a better recipe --
+// `model.decoder.hidden_layers: [48,24]` and
+// `training.num_iterations.bsdf_finetuning: 50000` -- but changing the
+// literal defaults HERE would silently corrupt every future bare (no --set)
+// run_sweep.py invocation: resumability is purely name-based
+// (`run_combo`'s `already_done` check reads only `summary.json`'s status,
+// never the recipe that produced it), and every gate material already has a
+// COMPLETED [128,64]-era checkpoint sitting at the exact no-suffix job name
+// a changed default would also produce. A bare invocation would skip
+// training entirely and silently report the old checkpoint's stale numbers
+// as if they were the new recipe's. Every numbered Stage's result in
+// `results/STAGE*.md` was also measured against THIS template's literal
+// values, so changing them here would retroactively misdescribe those
+// citations too.
+//
+// The real recommendation lives in the `--set` overrides, not in this file:
+//
+//     --set model.decoder.hidden_layers=[48,24] \
+//           training.num_iterations.bsdf_finetuning=50000
+//
+// which is exactly what `rtbcnam/PLAN.md`'s Stage 7 section specifies.
+// `--set`'s own override-hash job-name suffix (`_derive_override_tag`)
+// means this can never collide with a baseline checkpoint by construction
+// -- the same mechanism that made every capacity/iteration test in this
+// project safe to run without first auditing what already existed on disk.
+//
 // NAMED DELIBERATELY OUTSIDE THE rtbcnam_sweep_* NAMESPACE. The per-combo
 // configs the sweep generates are rtbcnam_sweep_<combo>.json, so a template
 // called rtbcnam_sweep_template.json would sit inside the glob used to clean
@@ -18,6 +46,9 @@
 //   KEPT, because measured load-bearing in rtcnam:
 //     - model.decoder.hidden_layers [128,64]. Worth ~10.6 dB at 10.0bpp
 //       (SIMPLIFICATION_PLAN.md Stage B: stripping it cost 36.05 -> 23.64).
+//       Decoder CAPACITY is still needed; this exact WIDTH is not --
+//       results/CAPACITY_SWEEP.md found [48,24] costs nothing. See the
+//       header note above.
 //     - model.decoder.output_clamp 100.0 and model.sampler.weight_cap 1.0.
 //       Together ~1.8 dB on leather and ~18 dB on carpaint, with fireflies
 //       returning when stripped (Stage C: carpaint 25.39 -> 7.37).
@@ -54,6 +85,10 @@
     "training": {
         "num_iterations": {
             "bsdf": 100000,
+            // 50000 is the validated, safe value (results/ITERATION_SWEEP.md:
+            // quality-neutral on leather/carpaint/ceramic, ~41% faster on
+            // this phase alone) -- not baked in here, see the header note's
+            // --set recipe for why.
             "bsdf_finetuning": 100000,
             // Zero on purpose, and it is a claim rather than a default. See
             // the header note and PLAN.md Stage 3.
@@ -174,15 +209,22 @@
             "hidden_activations": "LeakyReLU"
         },
         "decoder": {
-            // Load-bearing, ~10.6 dB. See the header note.
+            // [128,64]'s ~10.6 dB load-bearing figure was measured against
+            // RTCNAM's num_latents=8, never re-checked against this
+            // architecture's 12 until results/CAPACITY_SWEEP.md did:
+            // [48,24] -- an 8x smaller first layer -- matches [128,64]
+            // quality on leather/carpaint/ceramic/aluminum/velvet,
+            // full-length, and [16,8] is where it actually breaks (leather
+            // -9.1 dB, the first axis found to break its "eighth null axis"
+            // ceiling). [48,24] is the recommended value; not baked in here,
+            // see the header note's --set recipe for why.
             //
-            // One caveat specific to rtbcnam: that figure was measured against
-            // num_latents 8, and this architecture feeds 12. Worth one
-            // `--set model.decoder.hidden_layers=[160,80]` probe at Stage 3,
-            // not a full axis. Stay under 256 per layer either way: [256,128]
-            // fails at model construction with
-            // `getCooperativeVectorMatrixSize ... SLANG_E_INVALID_ARG`. The
-            // coopvec limit is width, not depth, so [128,128,64] builds fine.
+            // [160,80] (an earlier, untested guess that capacity should go
+            // UP for 12 latents, not down) is not buildable AT ALL: real
+            // coopvec limit is ROW COUNT in [1, 128], not "under 256 per
+            // layer" as this comment used to claim -- [256,128] failing was
+            // never evidence of a 256 ceiling, 256 itself was the offending
+            // row count. Every per-layer width must be <= 128.
             "hidden_layers": [
                 128,
                 64
