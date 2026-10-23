@@ -1,79 +1,20 @@
-// rtbcnam sweep template -- the base config rtbcnam/harness/run_sweep.py
-// clones for every (material, BC6H pyramid preset, mips) combo.
-// build_config() overwrites reference_materials, latents.num_mip_levels,
-// latents.num_channels and latents.bc_grid.feature_resolutions per combo, and
-// --iteration-scale rewrites the iteration counts; everything else here is the
-// recipe under test and is shared by every run in a sweep.
+// Base configuration for BC6H pyramid sweeps. The sweep driver overrides the
+// material, mip count, channel count, feature resolutions, and optionally the
+// iteration counts for each run.
 //
-// THIS FILE'S decoder.hidden_layers ([128,64]) AND bsdf_finetuning (100000)
-// ARE DELIBERATELY NOT the current recommendation. `results/CAPACITY_SWEEP.md`
-// and `results/ITERATION_SWEEP.md` found a better recipe --
-// `model.decoder.hidden_layers: [48,24]` and
-// `training.num_iterations.bsdf_finetuning: 50000` -- but changing the
-// literal defaults HERE would silently corrupt every future bare (no --set)
-// run_sweep.py invocation: resumability is purely name-based
-// (`run_combo`'s `already_done` check reads only `summary.json`'s status,
-// never the recipe that produced it), and every gate material already has a
-// COMPLETED [128,64]-era checkpoint sitting at the exact no-suffix job name
-// a changed default would also produce. A bare invocation would skip
-// training entirely and silently report the old checkpoint's stale numbers
-// as if they were the new recipe's. Every numbered Stage's result in
-// `results/STAGE*.md` was also measured against THIS template's literal
-// values, so changing them here would retroactively misdescribe those
-// citations too.
+// The literal decoder width and fine-tuning count retain the baseline recipe.
+// Prefer --set model.decoder.hidden_layers=[48,24]
+// --set training.num_iterations.bsdf_finetuning=50000 for new runs. Overrides
+// receive distinct job names, while changing these defaults could reuse existing
+// baseline checkpoints because resume matching does not compare recipes.
 //
-// The real recommendation lives in the `--set` overrides, not in this file:
+// Keep this file outside the generated rtbcnam_sweep_* namespace so generated-
+// config cleanup does not remove the template.
 //
-//     --set model.decoder.hidden_layers=[48,24] \
-//           training.num_iterations.bsdf_finetuning=50000
-//
-// which is exactly what `rtbcnam/PLAN.md`'s Stage 7 section specifies.
-// `--set`'s own override-hash job-name suffix (`_derive_override_tag`)
-// means this can never collide with a baseline checkpoint by construction
-// -- the same mechanism that made every capacity/iteration test in this
-// project safe to run without first auditing what already existed on disk.
-//
-// NAMED DELIBERATELY OUTSIDE THE rtbcnam_sweep_* NAMESPACE. The per-combo
-// configs the sweep generates are rtbcnam_sweep_<combo>.json, so a template
-// called rtbcnam_sweep_template.json would sit inside the glob used to clean
-// those up. That exact mistake deleted rtcnam's template once. run_sweep.py
-// also fails fast with a clear message if this file is missing.
-//
-// Derived from configs/rtcnam_template.json. Full evidence for every
-// inherited value, and the reason for every omission, is in
-// rtbcnam/INHERITED_FINDINGS.md. Summary of the differences:
-//
-//   KEPT, because measured load-bearing in rtcnam:
-//     - model.decoder.hidden_layers [128,64]. Worth ~10.6 dB at 10.0bpp
-//       (SIMPLIFICATION_PLAN.md Stage B: stripping it cost 36.05 -> 23.64).
-//       Decoder CAPACITY is still needed; this exact WIDTH is not --
-//       results/CAPACITY_SWEEP.md found [48,24] costs nothing. See the
-//       header note above.
-//     - model.decoder.output_clamp 100.0 and model.sampler.weight_cap 1.0.
-//       Together ~1.8 dB on leather and ~18 dB on carpaint, with fireflies
-//       returning when stripped (Stage C: carpaint 25.39 -> 7.37).
-//     - model.latents.normalize false. MANDATORY, not a preference: train.py
-//       asserts it for any path running direct optimization, and the four
-//       bounding variants behind that assert are documented in
-//       ntc_latent_texture.slang. Do not re-run them.
-//     - data_generation.batch_size_schedule as square numbers. "2k"/"8k"
-//       fail at config load with "Batch size must be a square number".
-//
-//   DROPPED, because this architecture has no equivalent:
-//     - num_pos_enc_waves and all of encode_position. There is no positional
-//       encoding here, so the grid-lattice failure mode cannot occur. The
-//       analogous risk is a 4-pixel BLOCK lattice from a poor per-block
-//       line-segment fit; rtbcnam/harness/latent_field_probe.py looks for it.
-//     - quantize{} and training.num_iterations.decoder_repair. BC6H
-//       quantization happens inside the differentiable forward pass, so there
-//       is no post-training rounding step to absorb. decoder_repair is 0 as a
-//       PREDICTION; PLAN.md Stage 3 checks it, and the check must be run with
-//       repair OFF (rtcnam measured quantization "free" with repair ON, which
-//       is a different claim).
-//     - coverage_penalty, latent_smoothness, freeze_decoder_during_diropt.
-//       Already inert by configuration in rtcnam (weight 0, weight 0, False)
-//       and never enabled in any reported run. train.py reads all three with
-//       .get() defaults, so omitting them changes nothing.
+// Direct optimization requires latent normalization to be disabled. BC6H
+// quantization is part of decoding, so no post-training grid quantization or
+// decoder-repair phase is needed. Optional NTC regularizers remain at their
+// disabled defaults. Batch sizes must be square numbers.
 {
     "reference_materials": [
         {
@@ -85,13 +26,9 @@
     "training": {
         "num_iterations": {
             "bsdf": 100000,
-            // 50000 is the validated, safe value (results/ITERATION_SWEEP.md:
-            // quality-neutral on leather/carpaint/ceramic, ~41% faster on
-            // this phase alone) -- not baked in here, see the header note's
-            // --set recipe for why.
+            // Baseline value; prefer the 50000-iteration override for new runs.
             "bsdf_finetuning": 100000,
-            // Zero on purpose, and it is a claim rather than a default. See
-            // the header note and PLAN.md Stage 3.
+            // BC6H quantization is already part of the differentiable decode.
             "decoder_repair": 0,
             "sampler": 50000,
             "aux": 50000
@@ -125,20 +62,12 @@
         "seed": 0,
         "latents": {
             "type": "bc_grid",
-            // RTNAM's OUTER Russian-roulette mip selection, which is
-            // orthogonal to the BC6H textures' own hardware mip chains. Those
-            // chains always exist, because hardware trilinear filtering is one
-            // of the three reasons this architecture exists.
+            // RTNAM's OUTER Russian-roulette mip selection. Each outer level is
+            // uploaded as a separate single-level BC6H texture; hardware filters
+            // within that level but does not build or blend a full mip chain.
             "num_mip_levels": 1,
-            // 4 texture sets x 3 channels. DERIVED from
-            // bc_grid.feature_resolutions by run_sweep.build_config(), not read
-            // from here -- a stale value would be a silent Python/Slang layout
-            // mismatch. Present only so the template parses standalone.
-            //
-            // This is 12, not RTCNAM's 8, and the difference is structural
-            // rather than tuned: BC6H is RGB-only, so channel count and pyramid
-            // depth move together. It is also a real capacity increase, which
-            // partly offsets the 3-channels-per-texture constraint.
+            // Three channels per feature set. The sweep derives this from the
+            // pyramid depth; this literal only makes the template standalone.
             "num_channels": 12,
             "normalize": false,
             "bc_grid": {

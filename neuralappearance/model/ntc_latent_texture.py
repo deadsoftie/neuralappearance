@@ -18,29 +18,18 @@ if TYPE_CHECKING:
     from datagen import ReferenceMaterials
 
 
-# Packed-4-bit grid checkpoint format: a self-describing binary file per
-# grid, written only once `NtcLatentTexture.quantized` is True (see
-# `quantize_grids()`). Self-describing (carries its own bits/range) rather
-# than relying on `model.json`'s `_params` because `NeuralModel.load_checkpoint()`
-# loads checkpoint images before checkpoint params (`neural_material_model.py`'s
-# `load_checkpoint()`), so this file can't assume range metadata is available
-# yet at image-load time.
+# Quantized grids use self-describing binary files because checkpoint images
+# load before the parameter metadata.
 _QUANTIZED_GRID_MAGIC = b'NTC4'
 _QUANTIZED_GRID_VERSION = 1
 _QUANTIZED_GRID_HEADER = struct.Struct('<4sBBIIff')  # magic, version, bits, resolution, num_channels, lo, hi
 
 
 def _pack_quantized_grid(data: np.ndarray, lo: float, hi: float, bits: int) -> bytes:
-    """Pack an already-quantized grid (values at ``2**bits`` levels spanning
-    ``[lo, hi]``, as produced by ``quantize_grids()``) into a self-describing
-    binary blob: a fixed header followed by two 4-bit indices per byte.
+    """Pack a quantized grid as a header followed by two indices per byte.
 
-    Deliberately diverges from RTXNTC's literal on-disk layout (4 features
-    packed into one uint16 per grid cell): this packs 2 consecutive flat-
-    buffer values per byte instead. Same 4-bits/value storage cost and
-    resulting file size; the byte order only matters if something reads it
-    directly on the GPU, which this project defers (dequantize-at-load,
-    QUANTIZATION_PLAN.md Decision 3).
+    The header records the quantization levels and range for dequantization on
+    load; consecutive flat values occupy the low and high nibbles.
     """
     if not (1 <= bits <= 4):
         # Packing below hardcodes one nibble (4 bits) per index -- a larger
@@ -97,20 +86,10 @@ def _unpack_quantized_grid(buf: bytes) -> tuple[int, int, int, float, float, np.
 
 
 class NtcLatentTexture(IModel):
-    """NTC-style compressed latent texture: a pair of bilinearly-sampled
-    feature grids per (tile, mip) -- high-res and low-res, both at a
-    resolution lower than the output texture -- decoded into the shared
-    ``num_latents``-channel code by a small fixed MLP, instead of one dense
-    per-texel buffer. See ``model/ntc_latent_texture.slang`` and rtcnam/PLAN.md for
-    the exact grid-shape/decoder recipe this mirrors (NVIDIA's shipped
-    RTXNTC SDK) and the Slang file's header comment for what this first
-    implementation simplifies away.
+    """NTC-style high/low-resolution feature grids decoded by a small MLP.
 
-    Implements the same ``ILatentTexture`` contract as ``LatentTexture``,
-    so every existing consumer (BsdfDecoder, Sampler, AuxDecoder, every
-    training kernel, the renderer, the visualizer) works against it
-    unchanged. A config flag in ``NeuralModel`` picks which one gets built;
-    nothing downstream needs to know which.
+    Implements the same latent-sampling interface as `LatentTexture`, with two
+    grids per (tile, mip) instead of a dense per-texel buffer.
     """
 
     @classmethod
@@ -191,20 +170,8 @@ class NtcLatentTexture(IModel):
         self.material_texture_resolution: list[int] = []
         self.material_texture_wrap: list[bool] = []
 
-        # Until `training_ntc_warmstart()` runs, the grid is still at its
-        # zero init and the decode MLP is untrained, so this texture decodes
-        # to values `BsdfDecoder` was never trained for. Rendering that is
-        # not merely meaningless (see `generate_from_encoder` below) -- it
-        # hangs: those latents drive `BsdfDecoder` (ScaledSigmoid, scale
-        # 1e5) to extreme values, and the resulting importance weights are
-        # huge but finite, so they slip past the path tracer's isinf/isnan
-        # guard and stall its Russian-roulette termination indefinitely
-        # (observed: GPU pegged at 100% with the host idle on a fence, for
-        # 30+ minutes, at the BsdfEncoding end-of-phase checkpoint).
-        # `checkpoint.py` skips the neural render while this is False.
-        # Bounding the decoded latents hard enough to survive that render
-        # was tried first and is NOT a viable alternative: it saturates the
-        # representation and wrecks quality (see ntc_latent_texture.slang).
+        # Untrained grids can produce extreme latents and unstable path-tracing
+        # weights, so checkpoint rendering waits for warm-start or optimization.
         self.ready_for_render = False
 
         # Set by `quantize_grids()`; drives `save_checkpoint_images()`'s
@@ -295,21 +262,7 @@ class NtcLatentTexture(IModel):
         self.module = module
 
     def generate_from_encoder(self, *args, **kwargs) -> None:
-        """No-op: `train.py`'s `training_bsdf_encoding()` and the checkpoint
-        machinery (`checkpoint/checkpoint.py`'s `encode_latent_texture_if_needed`)
-        call this unconditionally on whatever `latent_texture.instances[0]` is,
-        both at BsdfEncoding checkpoints and once at that phase's end, the same
-        way they do for the dense `LatentTexture`. For the dense path this
-        bakes the encoder's live output into the texture; for this grid path
-        there is nothing meaningful to bake yet -- the grid stays at its
-        zero/random init until `train.py`'s `training_ntc_warmstart()` phase
-        actually trains it (a real regression, not a bake; see that
-        function's docstring for why a simple copy can't work here). Any
-        checkpoint saved during `BsdfEncoding` for this path will show
-        whatever the untrained grid currently decodes to -- expected and
-        harmless, since those checkpoints aren't the ones that matter for
-        this path.
-        """
+        """Skip dense encoder baking; NTC grids learn during warm-start."""
 
     def make_optimizable(self) -> None:
         # `grids_frozen` has to survive this call. `InstancedComponent.
@@ -326,70 +279,20 @@ class NtcLatentTexture(IModel):
             grid.make_optimizable()
 
     def freeze_grids(self) -> None:
-        """Make the grids non-trainable while leaving the decode MLP trainable.
+        """Freeze grids while keeping the decode MLP trainable.
 
-        The quantize tail needs exactly this split. RTXNTC's recipe (and
-        rtcnam/PLAN.md's own description of it) is "freeze the grid, fine-tune
-        the network": the decode MLP is the thing that reads the rounded grid
-        values directly, so it is the thing best placed to absorb the
-        rounding error. Without this method the two could not be separated --
-        both are parameters of this one model, so marking the component
-        trainable trained the grids too, and leaving it untrained froze the
-        decode MLP along with them.
-
-        Two mechanisms, both needed:
-
-        - ``model_params()`` stops reporting the grid buffers, so the
-          optimizer never sees them. This is the load-bearing one: merely
-          clearing ``Texture.optimizable`` would not be enough, because
-          ``Texture.get_this()`` aliases ``buffer_grads`` onto the data
-          buffer for non-optimizable textures (SlangPy cannot bind null), so
-          an optimizer still holding those params would read grid *data* as
-          if it were gradients and destroy the grid.
-        - Each grid's ``optimizable`` flag is cleared, which makes
-          ``texture.slang``'s ``get_bilinear`` call ``detach()`` and skip the
-          atomic gradient scatter entirely. Not required for correctness
-          given the above, but it removes the wasted atomics.
+        ``model_params()`` excludes grid buffers from the optimizer. Clearing
+        each texture's flag also detaches fetches and skips gradient atomics.
         """
         self.grids_frozen = True
         for grid in self.high_res_grids + self.low_res_grids:
             grid.optimizable = False
 
     def quantize_grids(self, bits: int) -> list[dict]:
-        """4-bit (or ``bits``-bit) quantize every grid in place: round each
-        feature value to the nearest of ``2**bits`` evenly spaced levels
-        spanning that grid's own observed [min, max] range.
+        """Round every grid to ``2**bits`` levels spanning its own range.
 
-        rtcnam/QUANTIZATION_PLAN.md, Milestone A ("fast gate"): a one-off,
-        training-unaware round -- no dither, no optimizer involvement, no
-        change to ``ntc_latent_texture.slang``'s sampling code at all. The
-        caller (`train.py`'s `training_ntc_quantize()`) is responsible for
-        then excluding these grids from the optimizer (they are already
-        ``status == 'Done'`` by the time this runs, post-diropt) and running
-        a short decoder-only refinetune so `BsdfDecoder` adapts to the
-        rounding error -- this method only rounds; it does not freeze or
-        retrain anything itself.
-
-        Unlike RTXNTC's own scheme (additive-dither QAT against a fixed
-        [0, 1] range, Milestone B in the same plan), this uses each grid's
-        *own* range rather than [0, 1] -- this implementation's grids are not
-        squashed to any fixed interval (see ntc_latent_texture.slang's long
-        comment on why no output bound is applied), so a fixed [0, 1] would
-        either clip real values or waste most of the 16 levels on an interval
-        the grid never uses. Levels still span the data, so the quantization
-        step comparison against Milestone B remains meaningful despite the
-        different range convention.
-
-        Returns one stats dict per grid (``tile_idx``, ``mip_level``,
-        ``kind`` -- 'high_res' or 'low_res' --, ``min``, ``max``, ``step``,
-        ``rms_error``) for the caller to log. Also sets
-        ``self.quantized``/``self.quantize_bits``/
-        ``self.quantize_high_res_ranges``/``self.quantize_low_res_ranges``,
-        which ``save_checkpoint_images()`` reads to decide whether (and at
-        what range) to pack the grid on disk -- that's the only persistence
-        this method causes; the checkpoint *file* itself is untouched here
-        (see QUANTIZATION_PLAN.md's "report first, change the file format
-        second").
+        Records ranges for packed checkpoints and returns per-grid quantization
+        statistics. Freezing and decoder retraining are controlled by the caller.
         """
         levels = (1 << bits) - 1  # e.g. 15 for 4 bits, matching RTXNTC's own step = 1/15
         stats = []
@@ -531,6 +434,17 @@ class NtcLatentTexture(IModel):
 
         return out_files
 
+    def save_checkpoint_params(self, desc: list[str]) -> list[tuple[list[str], dict]]:
+        params = super().save_checkpoint_params(desc)
+        params.append((desc, {'ready_for_render': self.ready_for_render}))
+        return params
+
+    def load_checkpoint_params(self, params: dict) -> None:
+        super().load_checkpoint_params(params)
+        # Missing metadata is ambiguous, so preserve the historical behavior
+        # for trained checkpoints written before readiness was persisted.
+        self.ready_for_render = bool(params.get('ready_for_render', True))
+
     def load_checkpoint_images(
         self,
         desc: list[str],
@@ -541,7 +455,7 @@ class NtcLatentTexture(IModel):
         exr_load_items: list[tuple[Texture, Path]] = []
         high_res_ranges: list[tuple[float, float]] = [(0.0, 0.0)] * len(self.high_res_grids)
         low_res_ranges: list[tuple[float, float]] = [(0.0, 0.0)] * len(self.low_res_grids)
-        quantized_any = False
+        packed_count = 0
         bits_seen: int | None = None
 
         tile_idx = 0
@@ -573,7 +487,7 @@ class NtcLatentTexture(IModel):
                             )
                             grid.from_numpy(values.astype(np.float16))
                             ranges_out[grid_idx] = (lo, hi)
-                            quantized_any = True
+                            packed_count += 1
                             bits_seen = bits
                         else:
                             exr_load_items.append((grid, grid.checkpoint_image_path(grid_desc, folder)))
@@ -597,10 +511,7 @@ class NtcLatentTexture(IModel):
         # Failing here instead costs a clear message and loses nothing: the
         # files on disk are still intact at this point.
         total_grids = len(self.high_res_grids) + len(self.low_res_grids)
-        packed_count = sum(
-            1 for lo, hi in high_res_ranges + low_res_ranges if (lo, hi) != (0.0, 0.0)
-        )
-        if quantized_any and packed_count != total_grids:
+        if packed_count and packed_count != total_grids:
             raise ValueError(
                 f'Mixed checkpoint in {folder}: {packed_count} of {total_grids} '
                 'grids are in the packed 4-bit format and the rest are EXR. '
@@ -608,12 +519,12 @@ class NtcLatentTexture(IModel):
                 'range and destroy them. Restore a complete checkpoint.'
             )
 
-        self.quantized = quantized_any
+        self.quantized = packed_count > 0
         self.quantize_bits = bits_seen
         self.quantize_high_res_ranges = high_res_ranges
         self.quantize_low_res_ranges = low_res_ranges
 
-        if quantized_any:
+        if self.quantized:
             # A grid that was loaded from the packed format is already
             # rounded to its quantization lattice, and continuous optimizer
             # updates would walk it straight back off that lattice -- the
@@ -624,7 +535,7 @@ class NtcLatentTexture(IModel):
             # adapt to quantization anyway (see `freeze_grids`).
             self.freeze_grids()
 
-        # A checkpoint on disk holds real trained grid values, so anything
-        # loading one (the visualizer, render_headless, a repeat training
-        # job) can render it.
+        # Legacy default for checkpoints without readiness metadata. New
+        # checkpoints override this in load_checkpoint_params(), which the
+        # model loader calls immediately after loading images.
         self.ready_for_render = True

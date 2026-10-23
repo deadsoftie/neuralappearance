@@ -1,30 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pack a trained `BcLatentTexture` grid's values into real BC6H mode-10
-block bytes.
+"""Pack trained `BcLatentTexture` values into BC6H mode-10 block bytes.
 
-The single source of truth for this, used by both:
-
-  - `rtbcnam/harness/export_bc6h.py` (Stage 4): offline `.dds` export and
-    bit-exactness verification against the real GPU.
-  - `model/bc_latent_texture_hardware.py` (Stage 5): live, render-time
-    upload of the same bytes to a real hardware `Texture2D`.
-
-Kept inside `neuralappearance/model/` rather than importing
-`rtbcnam/harness/bc6h_reference.py` (which `export_bc6h.py` itself depends
-on for file I/O and the hardware-verified DECODE path) so that production
-model code never depends on a test-harness module -- the dependency runs the
-other way. The mode-10 bit layout itself is duplicated here on purpose, same
-rationale `bc_latent_texture.py`'s own `endpoint_from_value` already states
-for duplicating BC6H constants: Slang constants are not reachable from
-Python, so a handful of small, independently-testable functions beat a
-cross-tree import. `rtbcnam/harness/test_bc6h_pack.py` cross-checks this
-module's `pack_mode10_block` byte-for-byte against
-`bc6h_reference.pack_mode10_block`, which Stage 0 verified bit-exactly
-against both DirectXTex and the real GPU
-(`rtbcnam/results/STAGE0.md`) -- so a divergence here is caught immediately
-rather than silently shipping a second, untested packer.
+Shared by offline export and render-time texture upload. The small bit-layout
+helpers live here so production model code does not depend on export tooling.
 """
 
 from __future__ import annotations
@@ -51,9 +31,7 @@ def quantize_endpoint(value_units: np.ndarray, is_signed: bool) -> np.ndarray:
 
 
 def quantize_index(position: np.ndarray, is_anchor: bool) -> np.ndarray:
-    """Round-and-clamp a texel's position to its index lattice -- 7 levels
-    at the block anchor, 15 everywhere else. Mirrors `bc6h_quantize_index`
-    (`rtbcnam/results/STAGE4.md`)."""
+    """Round to 7 index levels at the block anchor and 15 elsewhere."""
     levels = _ANCHOR_LEVELS if is_anchor else _INDEX_LEVELS
     return np.clip(np.round(position * levels), 0, levels).astype(np.int64)
 
@@ -64,12 +42,8 @@ def pack_mode10_block(endpoint0: tuple[int, int, int], endpoint1: tuple[int, int
     fields (both endpoints stored absolutely, no delta transform), then 16
     indices -- the first (the block's anchor) at 3 bits, the rest at 4.
 
-    LSB-first bit order, matching the spec and
-    `bc6h_reference._BitWriter`. Hand-rolled rather than going through that
-    module's generic multi-mode machinery: mode 10's layout has no
-    interleaved high bits and no delta transform, so it is a fixed,
-    un-ambiguous sequence of fields and a generic bit writer buys nothing
-    here.
+    Fields are written least-significant-bit first. Mode 10 needs no
+    interleaved high bits or delta transform.
     """
     if len(indices) != 16:
         raise ValueError(f'Need 16 indices, got {len(indices)}.')

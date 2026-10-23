@@ -16,10 +16,8 @@ if TYPE_CHECKING:
     from datagen import ReferenceMaterials
 
 
-# BC6H mode 10 facts, mirrored from `model/bc6h.slang`. Duplicated on purpose
-# rather than imported: Slang constants are not reachable from Python, and a
-# divergence here is caught by
-# `rtbcnam/harness/test_bc_latent_texture.py::test_endpoint_scale_matches_slang`.
+# BC6H mode 10 constants, mirrored from bc6h.slang because Slang constants
+# are not directly accessible from Python.
 _BLOCK_SIZE = 4
 _CHANNELS_PER_SET = 3          # BC6H is RGB-only
 _ENDPOINT_CHANNELS = 6         # two endpoints, 3 channels each
@@ -32,19 +30,10 @@ _SUPPORTED_BLOCK_MODES = (10,)
 
 
 def endpoint_from_value(value: float, is_signed: bool) -> float:
-    """Approximate inverse of BC6H's decode chain: a target decoded float to
-    the NORMALISED endpoint parameter that produces roughly that value.
+    """Approximate the normalized endpoint parameter for a decoded value.
 
-    Used only to initialise the endpoints before the warm-start phase regresses
-    them against the encoder's field, so being approximate is fine. It exists
-    so the initialisation is expressed in latent units (what the field actually
-    looks like) rather than as a magic endpoint integer.
-
-    Inverts, in order: the bit reinterpretation (take the half's bit pattern),
-    `finish_unquantize`'s 31/32 or 31/64 scaling, and `unquantize`'s
-    `64 * |x| + 32`. Cross-checked against
-    `rtbcnam/harness/bc6h_reference.py`'s forward path by
-    `test_endpoint_init_lands_near_its_target`.
+    This inverse of half-bit reinterpretation, finish_unquantize, and unquantize
+    is used only to initialize endpoints in latent-value units.
     """
     bits = int(np.float16(value).view(np.uint16))
     magnitude = bits & 0x7FFF
@@ -66,20 +55,9 @@ def endpoint_from_value(value: float, is_signed: bool) -> float:
 
 
 class BcLatentTexture(IModel):
-    """Block-compressed latent texture: `num_sets` BC6H-shaped feature textures
-    whose sampled values ARE the latent, with no decode MLP.
+    """BC6H-shaped feature sets sampled directly as latent channels.
 
-    See `model/bc_latent_texture.slang` for the storage layout and the
-    decode-then-blend ordering, and `rtbcnam/PLAN.md` for why this architecture
-    exists at all (the short version: it removes the second network from the
-    fetch path, which Project 5 measured costing 8 to 19% under real per-lane
-    divergence, and it gets hardware filtering for free).
-
-    Implements the same `ILatentTexture` contract as `LatentTexture` and
-    `NtcLatentTexture`, so every existing consumer -- `BsdfDecoder`, `Sampler`,
-    `AuxDecoder`, every training kernel, the renderer, the visualizer -- works
-    against it unchanged. A config flag in `NeuralModel` picks which one gets
-    built; nothing downstream needs to know which.
+    Implements the common latent-sampling interface without a decode MLP.
     """
 
     @classmethod
@@ -140,12 +118,17 @@ class BcLatentTexture(IModel):
             raise ValueError(
                 f'model.latents.bc_grid.block_mode must be one of '
                 f'{_SUPPORTED_BLOCK_MODES}, got {block_mode}. Mode 10 is the '
-                'only one bc6h.slang implements; the two-subset modes need a '
-                'partition search and were never built because Stage 3\'s '
-                'quality gate cleared without them (rtbcnam/PLAN.md).'
+                'only mode implemented by bc6h.slang.'
             )
         if not feature_resolutions:
             raise ValueError('model.latents.bc_grid.feature_resolutions is empty.')
+        for set_idx, resolution in enumerate(feature_resolutions):
+            if resolution % _BLOCK_SIZE != 0:
+                raise ValueError(
+                    'model.latents.bc_grid.feature_resolutions must contain only '
+                    f'resolutions divisible by {_BLOCK_SIZE} (the BC6H block size); '
+                    f'got {resolution} at index {set_idx}.'
+                )
 
         expected_latents = _CHANNELS_PER_SET * len(feature_resolutions)
         if num_latents != expected_latents:
@@ -185,13 +168,8 @@ class BcLatentTexture(IModel):
         self.material_texture_resolution: list[int] = []
         self.material_texture_wrap: list[bool] = []
 
-        # Same contract as `NtcLatentTexture.ready_for_render`: until the
-        # warm-start phase has run, the textures hold their init values and
-        # decode to a field `BsdfDecoder` was never trained for. Rendering that
-        # is not merely meaningless -- for the NTC path it was observed to hang
-        # the path tracer, because huge-but-finite importance weights slip past
-        # the isinf/isnan guard and stall Russian-roulette termination.
-        # `checkpoint.py` skips the neural render while this is False.
+        # Checkpoint rendering waits until warm-start or direct optimization
+        # replaces the untrained initial textures.
         self.ready_for_render = False
 
     # ------------------------------------------------------------------ shapes
@@ -201,20 +179,7 @@ class BcLatentTexture(IModel):
         return len(self.feature_resolutions)
 
     def set_resolution(self, set_idx: int, mip_level: int) -> int:
-        """Texel resolution of one feature set at one mip level.
-
-        `feature_resolutions` are ABSOLUTE, not derived from the material's own
-        texture resolution the way `NtcLatentTexture`'s `grid_size_scale` is.
-        That matches how the preset table and BCf's own table 1 are written, and
-        it keeps the storage figure in `run_sweep.bc6h_storage_mb` independent
-        of which material is being trained. Every material in this repo is
-        4096x4096, so the distinction has no effect today; it would matter for a
-        mixed-resolution material set, where a set finer than the reference
-        texture would simply be wasted.
-
-        Floors at one 4x4 block: BC6H cannot store anything smaller, so a mip
-        chain does not shrink past it.
-        """
+        """Return an absolute feature resolution, floored at one BC6H block."""
         return max(_BLOCK_SIZE, self.feature_resolutions[set_idx] >> mip_level)
 
     def block_resolution(self, set_idx: int, mip_level: int) -> int:
@@ -236,17 +201,7 @@ class BcLatentTexture(IModel):
     # ------------------------------------------------------------------ IModel
 
     def _tiles(self) -> list[tuple[int, int]]:
-        """`(material_id, udim_id)` for every tile, in tile-index order.
-
-        SINGLE SOURCE OF TRUTH for tile ordering. Texture allocation, the tile
-        indirection table and checkpoint filenames all have to agree on it, and
-        deriving it independently in each place is precisely how
-        `NtcLatentTexture` ended up with save and load disagreeing about
-        filenames -- a bug that silently collapsed every mip onto one file.
-
-        Iterates `material_ids` rather than `udim_mapping.keys()` so the order
-        does not depend on dict insertion order matching the material list.
-        """
+        """Yield tiles in the order used by allocation and checkpoint I/O."""
         return [(material_id, udim_id)
                 for material_id in self.material_ids
                 for udim_id in self.udim_mapping[material_id]]
@@ -417,6 +372,17 @@ class BcLatentTexture(IModel):
                 [*desc, *position_tail], folder)
         return out_files
 
+    def save_checkpoint_params(self, desc: list[str]) -> list[tuple[list[str], dict]]:
+        params = super().save_checkpoint_params(desc)
+        params.append((desc, {'ready_for_render': self.ready_for_render}))
+        return params
+
+    def load_checkpoint_params(self, params: dict) -> None:
+        super().load_checkpoint_params(params)
+        # Missing metadata is ambiguous, so preserve the historical behavior
+        # for trained checkpoints written before readiness was persisted.
+        self.ready_for_render = bool(params.get('ready_for_render', True))
+
     def load_checkpoint_images(
         self,
         desc: list[str],
@@ -445,7 +411,7 @@ class BcLatentTexture(IModel):
         for (texture, _), bitmap in zip(load_items, bitmaps, strict=True):
             texture.load_from_bitmap(bitmap)
 
-        # A checkpoint on disk holds real trained values, so anything loading
-        # one (the visualizer, render_headless, a repeat training job) can
-        # render it.
+        # Legacy default for checkpoints without readiness metadata. New
+        # checkpoints override this in load_checkpoint_params(), which the
+        # model loader calls immediately after loading images.
         self.ready_for_render = True

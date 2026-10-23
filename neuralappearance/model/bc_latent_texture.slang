@@ -8,67 +8,19 @@ __exported import model.texture;
 __exported import model.bc6h;
 __exported import util.texture_helpers;
 
-// Block-compressed latent texture. rtbcnam/PLAN.md Stage 2.
+// Block-compressed latent texture with no decode MLP or positional encoding:
+//   latent[3 * NumSets] = concat_s(bilinear_s(bc6h_decode(texel)))
+// Descending set resolutions provide the feature pyramid.
 //
-// Instead of a dense per-texel buffer (`LatentTexture`) or a feature-grid pair
-// plus a decode MLP (`NtcLatentTexture`), this stores `NumSets` BC6H-shaped
-// feature textures per (tile, mip) and concatenates their sampled values to
-// form the latent directly. There is NO decode MLP and NO positional encoding:
+// Each set stores six endpoint channels at 4x4-block resolution and one
+// position channel at texel resolution. Endpoints are normalized and scaled to
+// endpoint-integer units before decoding. Reusing Texture<N> provides
+// differentiable sampling, gradient scatter, and checkpoint persistence.
 //
-//   latent[3 * NumSets] = concat_s( bilinear_s( bc6h_decode(texel) ) )
-//
-// That is BCf's own structure (docs/deep-dives/dd1-block-compressed-features.md,
-// table 1's Ttheta0..Ttheta3) with RTNAM's `BsdfDecoder` in place of BCf's own
-// tiny one. Multi-resolution capacity comes from the descending set
-// resolutions rather than from a Fourier encoding, which is why the
-// grid-lattice failure mode RTCNAM spent a day on cannot occur here.
-//
-// ---------------------------------------------------------------------------
-// Storage: two textures per set, at different resolutions
-// ---------------------------------------------------------------------------
-//
-// BC6H mode 10 stores, per 4x4 block, two endpoints (3 channels each) shared by
-// all 16 texels, plus one index per texel. Those live at different rates, so
-// they are two separate `Texture<N>` instances per set:
-//
-//   `endpoints[g]`  `Texture<6>` at block resolution (ceil(res / 4)):
-//                   channels 0-2 are endpoint 0, channels 3-5 endpoint 1.
-//   `positions[g]`  `Texture<1>` at full texel resolution: where each texel
-//                   sits along its block's line segment, in [0, 1].
-//
-// Reusing `Texture<N>` rather than hand-rolling buffers is deliberate: it
-// brings the proven differentiable fetch, the atomic gradient scatter, the
-// `buffer_grads` aliasing for non-optimizable textures, and the checkpoint
-// path, none of which need to be rewritten or re-tested.
-//
-// Endpoints are stored NORMALISED, in roughly [-1, 1], and scaled by
-// `endpoint_scale` on the way into `bc6h_decode_mode10`, which works in
-// endpoint-integer units. Stage 1 measured why: the position gradient runs
-// three to four orders of magnitude above an endpoint gradient (the ratio is
-// exactly the endpoint separation, which is physical), and a raw Adam step of
-// 1e-3 in endpoint units would need a thousand steps to cross one quantization
-// level. Half precision in [-1, 1] has ~11 bits of significand, so scaling by
-// 512 still resolves well below one endpoint unit.
-//
-// ---------------------------------------------------------------------------
-// Filtering: decode per texel, THEN blend
-// ---------------------------------------------------------------------------
-//
-// `get_bilinear` decodes each of the four neighbouring texels independently and
-// blends the decoded results. That ordering is not a detail: it is what the
-// fixed-function texture unit does, so it is what Stage 5's hardware path will
-// reproduce. Blending endpoints or indices first and decoding once would be
-// cheaper and WRONG, and it would make Stage 3's quality number describe
-// something no hardware will ever produce.
-//
-// Cost, stated plainly: 4 taps x `NumSets` sets = 16 decodes per latent fetch
-// at the default 4 sets, each needing a 6-value endpoint read and a 1-value
-// position read. That is heavy, and it is why Stage 5 exists -- there, one
-// hardware `SampleLevel` per set replaces four software decodes. Stage 2
-// deliberately accepts the cost so Stage 3's quality answer is not entangled
-// with a new resource-binding path. A cheap future optimisation, not taken
-// here: three of the four taps usually share a block, so the endpoint read
-// could be hoisted.
+// Bilinear filtering decodes all four neighboring texels before blending their
+// values, matching fixed-function BC6H filtering. Blending encoded parameters
+// first would produce different results. Hardware sampling replaces these four
+// software decodes per set with one filtered fetch.
 struct BcLatentTexture<
     int NumSets,
     int NumTiles,
@@ -93,24 +45,9 @@ struct BcLatentTexture<
         return material_texture_resolution[material_id];
     }
 
-    // Decode one texel of one set, exactly as hardware would. FORWARD ONLY --
-    // no differentiability attribute, deliberately, matching Texture._get_code's
-    // own shape (also no attribute, only a registered backward). See the long
-    // comment below on why this is load-bearing, not a style choice.
-    //
-    // The endpoint lookup is at BLOCK granularity -- all 16 texels in a block
-    // share one line segment, which is the format's defining constraint and
-    // the thing Stage 3 is really testing the latent against.
-    //
-    // `is_anchor`: the real format gives only 3 bits (not 4) to the texel at
-    // local raster position 0 of each 4x4 block -- a hardware encoding
-    // constraint, not a training choice. Found at Stage 4
-    // (`rtbcnam/results/STAGE4.md`): measured on a real trained checkpoint,
-    // 35.55% of all blocks needed an anchor index this file's earlier version
-    // could not express, before `bc6h_quantize_index` grew an `is_anchor`
-    // parameter. Do not remove this -- it is what makes Stage 4's "export is
-    // lossless" claim actually true, rather than true of an unconstrained
-    // simulation that the real format cannot reproduce.
+    // Forward-only decode with an explicit backward below. All texels in a 4x4
+    // block share one endpoint pair. The block's first texel is the anchor and
+    // has a 3-bit index; all other texels have 4-bit indices.
     float3 decode_texel(int grid_idx, uint2 texel)
     {
         uint2 block = texel / 4;
@@ -123,39 +60,9 @@ struct BcLatentTexture<
         return bc6h_decode_mode10(endpoint0, endpoint1, position[0], get_is_signed(), is_anchor);
     }
 
-    // Manual backward for one texel: given the incoming gradient on the
-    // decoded float3, chain explicitly through bc6h_decode_mode10 and
-    // scatter into the endpoint/position buffers via _get_code_bwd.
-    //
-    // WHY THIS CANNOT BE AUTOMATIC. bc6h_decode_mode10 has a hand-written
-    // custom derivative (Stage 1) because its forward pass is an integer
-    // pipeline with a true zero gradient almost everywhere. Stage 2 found,
-    // the hard way -- by noticing the trained texture never moved from its
-    // init value at ANY checkpoint across an entire training run -- that
-    // Slang's automatic differentiation of an OUTER [Differentiable]
-    // function does NOT correctly invoke a NESTED callee's registered
-    // custom derivative when that callee has DIFFERENTIABLE VALUE
-    // PARAMETERS (DifferentialPair-based, like bc6h_decode_mode10's
-    // endpoint0/endpoint1/position). Verified with a minimal,
-    // bc6h-independent repro: a trivial custom-derivative function called
-    // ordinarily from inside another [Differentiable] function silently
-    // produces an exact zero, with no warning and no compile error,
-    // regardless of attribute choice on either function.
-    //
-    // What DOES survive nesting (verified with the same minimal repro, at
-    // the SAME nesting depth this code actually needs): a function with NO
-    // differentiable value parameters of its own, whose derivative acts
-    // entirely through SIDE EFFECTS -- exactly _get_code/_get_code_bwd's own
-    // shape, which NtcLatentTexture's grids have relied on all along. So
-    // this function reproduces that shape one level up: decode_texel and
-    // this backward both have no differentiable VALUE parameters (tex's
-    // buffers carry the real state), and the backward manually invokes
-    // bwd_diff(bc6h_decode_mode10) itself -- an EXPLICIT call, not a nested
-    // ordinary one -- then threads the result into _get_code_bwd's own
-    // atomic scatter by hand.
-    //
-    // Do not "simplify" this back into an ordinary nested call. Re-run
-    // rtbcnam/results/STAGE2_GRADIENT_BUG.md's reproduction first.
+    // Chain explicitly through bc6h_decode_mode10, then scatter gradients
+    // into the endpoint and position buffers. Nested automatic differentiation
+    // does not reliably invoke the decoder's custom derivative.
     void decode_texel_bwd(int grid_idx, uint2 texel, float3 d_out)
     {
         if (!is_grid_optimizable(grid_idx))
@@ -351,15 +258,7 @@ struct BcLatentTexture<
         }
     }
 
-    // Flat index into `endpoints`/`positions`. SET-MAJOR, then tile, then mip:
-    //
-    //     set_idx * (NumTiles * NumMipLevels) + tile_idx * NumMipLevels + mip
-    //
-    // Python's `model_init` builds the lists in exactly this nesting order, and
-    // `test_bc_latent_texture.py::test_texture_count_and_resolutions_per_mip`
-    // pins it. RTCNAM's equivalent bug read mip 0 for every mip and stayed
-    // invisible until a multi-mip run rendered wrong, so this is one of the few
-    // things worth a dedicated test.
+    // Set-major, then tile, then mip; Python uses the same allocation order.
     int get_grid_idx(int set_idx, int tile_idx, int mip_level)
     {
         return set_idx * (NumTiles * NumMipLevels) + tile_idx * NumMipLevels + mip_level;

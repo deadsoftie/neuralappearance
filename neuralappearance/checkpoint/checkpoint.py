@@ -42,15 +42,16 @@ class Checkpoint:
         model: NeuralModelCheckpoint,
         outfolder: Path,
         iteration: int,
+        create_folder: bool = True,
     ):
         self.module = module
         self.config = config
         self.model = model
 
-        # Create folder for the new checkpoint at ``iteration``.
         self.subpath = f'checkpoints/{iteration:08d}'
         self.folder = outfolder / self.subpath
-        self.folder.mkdir(exist_ok=True, parents=True)
+        if create_folder:
+            self.folder.mkdir(exist_ok=True, parents=True)
 
 
 def save_checkpoint(
@@ -90,15 +91,8 @@ def save_checkpoint(
 
     ckpt = Checkpoint(module, config, model_ckpt, outfolder, iteration)
 
-    # A latent texture can report that it is not yet in a renderable state.
-    # `NtcLatentTexture` (rtcnam) does so until its warm-start phase has run:
-    # before that its grid is still at zero init and its decode MLP is
-    # untrained, so it decodes to values `BsdfDecoder` was never trained for,
-    # which drive the path tracer's Russian-roulette termination into an
-    # indefinite stall rather than just producing a wrong image. The model
-    # itself is still saved -- only the diagnostic render and plots, which
-    # would be meaningless at that point anyway, are skipped. `LatentTexture`
-    # has no such attribute, so the dense path always renders, as before.
+    # Save model data even when an uninitialized latent texture is not yet safe
+    # to render. Dense textures default to renderable.
     if getattr(model_ckpt.latent_texture, 'ready_for_render', True):
         renderer.render_neural_materials(ckpt, reference_materials, data_generators)
         save_bsdf_plots(ckpt, reference_materials, data_generators)

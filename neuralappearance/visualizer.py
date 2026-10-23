@@ -54,24 +54,14 @@ def _format_mb(num_bytes: int) -> str:
     return f'{num_bytes / 1e6:.1f} MB'
 
 
-# Every checkpoint in this repo currently uses a single UDIM tile (1001), see
-# e.g. write_condition_c_checkpoint()'s "no UDIM suffix for the single-UDIM
-# case" note in latent_ntc_roundtrip.py. Matches _latent_texture_device_bytes'
-# default below.
 _SINGLE_UDIM_ID = 1001
 
 
 def _texture_list_device_bytes(material: f2.Material) -> int | None:
-    """Sum the real GPU device memory (bytes, straight from each Texture's own
-    ``memory_usage``, not inferred from any file size) across every texture a
-    native material has registered, UDIM tiles included.
+    """Sum GPU allocations for a reference material's registered textures.
 
-    Mirrors reference_materials.py's ``_detect_texture_metadata()`` traversal
-    of ``build_texture_list()``. Returns None for a material type that has no
-    such method (e.g. NeuralMaterial -- its "textures" are latent buffers,
-    not classic file-backed Texture resources, see
-    _latent_texture_device_bytes() below), so this only applies to
-    reference (MDL/MaterialX) materials.
+    Return None for materials without `build_texture_list()`, including neural
+    materials whose latent buffers are measured separately.
     """
     if not hasattr(material, 'build_texture_list'):
         return None
@@ -102,24 +92,18 @@ def _latent_texture_device_bytes(
     num_mip_levels: int,
     udim_id: int = _SINGLE_UDIM_ID,
 ) -> int | None:
-    """Sum the real GPU device memory (bytes) of a LatentTexture's per-mip
-    texel buffers for one material, straight from each buffer's own
-    ``memory_usage`` -- the actual allocation, not a file-size proxy (unlike
-    the on-disk checkpoint EXR, the live buffer size can't drift from what's
-    really resident on the device).
-    """
+    """Sum a material's live latent-texture GPU allocations across mips."""
     if isinstance(latent_texture, NtcLatentTexture):
-        # ntc_grid has no latent mips of its own -- one fixed-resolution
-        # high-res/low-res grid pair per tile regardless of num_mip_levels
-        # (a color-texture concept; see rtcnam/NTC_LATENT_TEXTURE_NOTES.md).
-        # Same tile_idx lookup as LatentTexture._texture_idx, just without a
-        # mip_level term.
         udim_stride = 100
         udim_idx = udim_id - 1001
         tile_idx = latent_texture.tile_indirection[material_id * udim_stride + udim_idx]
-        hi = latent_texture.high_res_grids[tile_idx]
-        lo = latent_texture.low_res_grids[tile_idx]
-        return hi.buffer.storage.memory_usage.device + lo.buffer.storage.memory_usage.device
+        mip_count = max(1, num_mip_levels)
+        total = 0
+        for mip_level in range(mip_count):
+            grid_idx = tile_idx * mip_count + mip_level
+            total += latent_texture.high_res_grids[grid_idx].buffer.storage.memory_usage.device
+            total += latent_texture.low_res_grids[grid_idx].buffer.storage.memory_usage.device
+        return total
 
     if isinstance(latent_texture, BcLatentTexture):
         # bc_grid stores `num_sets` independent (endpoints, positions)
@@ -1051,13 +1035,8 @@ class NeuralMaterialVisualizer:
         aux_trained = neural_model.aux is not None and neural_model.aux.status == 'Done'
         self.neural_model: NeuralModelCheckpoint = neural_model.get_checkpoint()
 
-        # rtbcnam Stage 5 (results/STAGE5.md): swap the trained BcLatentTexture
-        # for its render-only hardware counterpart. NeuralMaterial.configure()
-        # (rendering/neural_material.py) reads latent_texture.type_name fresh
-        # every time it generates the Slang source, so this swap alone is
-        # enough to make the whole visualizer render through
-        # BcLatentTextureHardware's real Texture2D + SampleGrad path -- no
-        # other change needed.
+        # Use hardware BC6H textures when requested. Material configuration
+        # reads the replacement type when generating its Slang module.
         if hardware_sampling:
             if not isinstance(self.neural_model.latent_texture, BcLatentTexture):
                 raise ValueError(
@@ -1438,22 +1417,7 @@ class NeuralMaterialVisualizer:
         self._update_storage_labels()
 
     def _update_storage_labels(self) -> None:
-        """Refresh each side-by-side label's real GPU memory usage for the
-        currently selected material, queried straight from each panel's own
-        GPU resources rather than inferred from a file size on disk.
-
-        Reference sums its MDL/MaterialX material's actual texture memory
-        (_texture_list_device_bytes(), same build_texture_list() traversal
-        reference_materials.py already uses to detect UDIMs/resolution).
-        Neural/Compressed/Compressed-BC7 sum their latent texture's per-mip
-        buffer allocations (_latent_texture_device_bytes()) -- previously
-        this line only showed the on-disk checkpoint EXR's size, and
-        Reference showed nothing at all, since it has no such EXR to measure.
-        A second line on the compressed panels adds the true compressed-file
-        size (.ntc / BC7 .dds) looked up from that project's own results CSV
-        -- the checkpoint directory itself only ever holds the decompressed
-        EXR, see _lookup_project3_ntc_size_bytes() /
-        _lookup_project6_bc7_size_bytes()."""
+        """Show selected-material GPU allocations and compressed file sizes."""
         rw = self.render_window
         checkpoint_mat = self.checkpoint_reference_materials[self.material_idx]
 
@@ -1751,12 +1715,9 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--hardware-sampling', action='store_true',
-        help='Render the bc_grid checkpoint through BcLatentTextureHardware -- '
-        'a real BC6H Texture2D sampled with SampleGrad through a real '
-        'anisotropic SamplerState -- instead of the software BcLatentTexture '
-        'decode path. rtbcnam/PLAN.md Stage 5 (results/STAGE5.md). Needs a '
-        'bc_grid checkpoint; open two visualizer instances, one with this flag '
-        'and one without, on the same checkpoint to compare side by side.',
+        help='Sample a bc_grid checkpoint through hardware BC6H textures '
+        'instead of software decoding. Compare against another instance '
+        'without this flag.',
     )
     args = parser.parse_args()
 

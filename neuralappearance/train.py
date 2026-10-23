@@ -1080,9 +1080,7 @@ def training_ntc_warmstart(job: TrainingJob) -> None:
         run_train_kernel=run_train_kernel,
     )
 
-    # The grid now holds real values, so checkpoints from here on can render
-    # it (checkpoint.py skips the neural render while this is False -- see
-    # `NtcLatentTexture.ready_for_render`).
+    # Warm-started compressed latents are valid for checkpoint rendering.
     neural_model.latent_texture.instances[0].ready_for_render = True
 
 
@@ -1208,21 +1206,8 @@ def training_bsdf_diropt(job: TrainingJob) -> None:
         config, neural_model.num_instances
     )
 
-    # rtcnam: optionally leave BsdfDecoder frozen through this phase, so it
-    # keeps exactly the function `BsdfEncoding` gave it and only the latent
-    # representation adapts. Default False preserves the stock behavior
-    # (decoder retrained jointly) bit-for-bit.
-    #
-    # Why this exists: every `ntc_grid` run retrains the decoder here for
-    # 100k iterations, while the dense baseline that renders correctly uses
-    # `bsdf_finetuning: 0` and never retrains its decoder at all. Probed
-    # directly, BsdfEncoding's decoder is well-behaved off-manifold (mean
-    # luminance 0.032 over uniform-random angles, nothing above 100),
-    # whereas after grid finetuning it is not (mean 172-670, 1-7% above
-    # 100) -- which is what blows up indirect path-tracing bounces. Three
-    # different latent bounds were tried first and none fixed it, so the
-    # decoder's retraining, not the latent distribution, is the remaining
-    # suspect. See rtcnam/NTC_LATENT_TEXTURE_NOTES.md.
+    # Optionally keep the encoded BSDF decoder fixed and optimize only latents.
+    # By default, decoder and latents are trained jointly.
     if not config['training'].get('freeze_decoder_during_diropt', False):
         neural_model.start_training(neural_model.decoder)
     else:
@@ -1272,6 +1257,12 @@ def training_bsdf_diropt(job: TrainingJob) -> None:
             **regularizer_params,
             _append_to=iteration_block.train_cmd,
         )
+
+    # Direct optimization also initializes compressed latents when warm start
+    # was skipped. Mark readiness before any checkpoint from this phase.
+    latent_texture = neural_model.latent_texture.instances[0]
+    if isinstance(latent_texture, (NtcLatentTexture, BcLatentTexture)):
+        latent_texture.ready_for_render = True
 
     job.run_phase_optimization(
         phase_state=phase_state,

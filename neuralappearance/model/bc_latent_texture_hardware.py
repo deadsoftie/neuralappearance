@@ -12,44 +12,20 @@ from .bc_latent_texture import BcLatentTexture
 
 
 class BcLatentTextureHardware(IModel):
-    """Render-time-only hardware counterpart to `BcLatentTexture`.
-    rtbcnam/PLAN.md Stage 5.
+    """Render-only BC6H view of a trained `BcLatentTexture`.
 
-    Never trained: built once, from an already-trained `BcLatentTexture`
-    (`from_bc_latent_texture()`), by packing its current endpoint/position
-    values into real BC6H block bytes (`model/bc6h_pack.py`, the same
-    packer `rtbcnam/harness/export_bc6h.py` uses and verifies bit-exact
-    against the real GPU, `rtbcnam/results/STAGE4.md`) and uploading them as
-    real compressed `Texture2D`s. `model/bc_latent_texture_hardware.slang`
-    samples them with the fixed-function texture unit via `SampleGrad`,
-    which is what drives real hardware anisotropic filtering -- see that
-    file's own header comment for why `SampleGrad` rather than `Sample` or
-    `SampleLevel`.
-
-    Implements the same `ILatentTexture` contract as `BcLatentTexture`,
-    `LatentTexture` and `NtcLatentTexture`, so every existing consumer --
-    `BsdfDecoder`, `Sampler`, `AuxDecoder`, the renderer, the visualizer --
-    works against it unchanged. There is deliberately no path from this
-    class back to a trainable one and no checkpoint save/load of its own:
-    it is a one-way, render-only VIEW of a `BcLatentTexture` checkpoint that
-    already exists, not a parallel model.
+    Conversion packs the current software parameters into compressed textures
+    sampled by the fixed-function texture unit. This snapshot is not trainable
+    and has no independent checkpoint state.
     """
 
     @classmethod
     def from_bc_latent_texture(
         cls, source: BcLatentTexture, max_anisotropy: int = 16,
     ) -> BcLatentTextureHardware:
-        """Snapshot `source`'s CURRENT values. `source` must already be
-        initialized (`model_init` run) and trained -- this reads
-        `endpoint_textures`/`position_textures` directly, the same buffers
-        `rtbcnam/harness/export_bc6h.py` reads from a loaded checkpoint.
+        """Snapshot an initialized, trained software texture's current values.
 
-        `max_anisotropy` is exposed here (rather than hardcoded) so Stage 5's
-        own open question -- whether a quality gap against the software path
-        is real anisotropic filtering behaving differently on
-        high-frequency content, or a bug -- can be tested directly: pass 1
-        to disable anisotropic filtering and isolate the effect
-        (`rtbcnam/results/STAGE5.md`).
+        Set `max_anisotropy` to 1 to disable anisotropic filtering.
         """
         if not hasattr(source, 'endpoint_textures'):
             raise ValueError(
@@ -59,6 +35,7 @@ class BcLatentTextureHardware(IModel):
 
         tex = cls(source.num_latents, source.feature_resolutions, source.bc_format,
                  source.num_mip_levels, max_anisotropy)
+        tex.ready_for_render = source.ready_for_render
         tex.num_tiles = source.num_tiles
         tex.material_ids = list(source.material_ids)
         tex.has_udims = dict(source.has_udims)
@@ -100,9 +77,8 @@ class BcLatentTextureHardware(IModel):
         self._source_endpoint_raw: list[np.ndarray] | None = None
         self._source_position_raw: list[np.ndarray] | None = None
 
-        # Built from an already-trained source, so there is no warm-start
-        # gap to wait out -- unlike BcLatentTexture.ready_for_render, which
-        # starts False.
+        # Direct construction has no warm-start phase. Conversion from a
+        # software texture overwrites this with the source's readiness.
         self.ready_for_render = True
 
     @property
@@ -142,9 +118,7 @@ class BcLatentTextureHardware(IModel):
                 format=spy_format, width=width, height=height, mip_count=1,
                 usage=spy.TextureUsage.shader_resource,
             )
-            # Not `create_texture(data=...)` -- see verify_bc6h_reference.py's
-            # own note on why that path mis-computes a compressed format's
-            # row pitch. `copy_from_numpy` honours the real block layout.
+            # Upload explicitly so compressed blocks use their actual row pitch.
             texture.copy_from_numpy(np.frombuffer(payload, dtype=np.uint8).copy())
             self.grids.append(texture)
 
@@ -158,6 +132,26 @@ class BcLatentTextureHardware(IModel):
             mag_filter=spy.TextureFilteringMode.linear,
             mip_filter=spy.TextureFilteringMode.linear,
             max_anisotropy=self.max_anisotropy,
+        )
+        self.clamp_sampler = device.create_sampler(
+            min_filter=spy.TextureFilteringMode.linear,
+            mag_filter=spy.TextureFilteringMode.linear,
+            mip_filter=spy.TextureFilteringMode.linear,
+            max_anisotropy=self.max_anisotropy,
+            address_u=spy.TextureAddressingMode.clamp_to_edge,
+            address_v=spy.TextureAddressingMode.clamp_to_edge,
+        )
+        self.nearest_sampler = device.create_sampler(
+            min_filter=spy.TextureFilteringMode.point,
+            mag_filter=spy.TextureFilteringMode.point,
+            mip_filter=spy.TextureFilteringMode.point,
+        )
+        self.nearest_clamp_sampler = device.create_sampler(
+            min_filter=spy.TextureFilteringMode.point,
+            mag_filter=spy.TextureFilteringMode.point,
+            mip_filter=spy.TextureFilteringMode.point,
+            address_u=spy.TextureAddressingMode.clamp_to_edge,
+            address_v=spy.TextureAddressingMode.clamp_to_edge,
         )
 
         self.tile_indirection_gpu = spy.Tensor.from_numpy(
@@ -202,4 +196,7 @@ class BcLatentTextureHardware(IModel):
             'material_texture_resolution': self.material_texture_resolution_gpu.storage.descriptor_handle_ro,
             'grids': [t.descriptor_handle_ro for t in self.grids],
             'samp': self.sampler.descriptor_handle,
+            'clamp_samp': self.clamp_sampler.descriptor_handle,
+            'nearest_samp': self.nearest_sampler.descriptor_handle,
+            'nearest_clamp_samp': self.nearest_clamp_sampler.descriptor_handle,
         }

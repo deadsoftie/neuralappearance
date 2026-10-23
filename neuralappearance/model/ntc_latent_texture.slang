@@ -7,26 +7,10 @@ import model.base_types;
 __exported import model.texture;
 __exported import util.texture_helpers;
 
-// NTC-style compressed latent texture. Instead of one dense per-texel
-// buffer (``LatentTexture``), this stores a PAIR of bilinearly-sampled
-// feature grids per (tile, mip) -- both at a resolution lower than that
-// mip's output texture by ``grid_size_scale`` (high-res) and half that
-// again (low-res), each with ``NumFeatures`` channels, flattened as
-// ``tile_idx * NumMipLevels + mip_level`` exactly like the dense path's
-// own mip chain -- and a small fixed decode MLP that
-// turns a (high-res sample, low-res sample, positional encoding, LOD)
-// tuple into the ``NumLatents``-channel code every other RTNAM component
-// (BsdfDecoder, Sampler, AuxDecoder, the renderer, the visualizer) already
-// expects, unchanged, via the shared ``ILatentTexture<NumLatents>``
-// interface. See rtcnam/PLAN.md for the exact grid-math/quantization
-// recipe this mirrors (NVIDIA's shipped RTXNTC SDK, not just the 2023
-// paper) and rtcnam/NTC_LATENT_TEXTURE_NOTES.md for the parts of that
-// recipe this first implementation simplifies away.
-//
-// Both grids always use the same channel count (``NumFeatures``), matching
-// RTXNTC's own ``FeatureGrid`` usage in RegressionKernels.h, where
-// ``highResFeatureGrid``/``lowResFeatureGrid`` are constructed with the
-// identical ``params.numFeatures``.
+// NTC-style compressed latent texture. A high/low-resolution feature-grid pair
+// per (tile, mip) is bilinearly sampled and decoded with positional encoding and
+// LOD into NumLatents channels. Grid pairs use the same flat tile-major layout
+// as the dense texture's mip chain and share NumFeatures channels.
 struct NtcLatentTexture<
     int NumTiles,
     int NumMipLevels,
@@ -96,55 +80,9 @@ struct NtcLatentTexture<
             decoder_input[idx++] = pos_enc[i];
         decoder_input[idx++] = lod;
 
-        // No bounding function on the output, deliberately, and
-        // `latents.normalize` must be FALSE in the config for this path.
-        //
-        // The stock `latents.normalize: true` makes the Encoder squash its
-        // own output through `normalize_latent_code` (`x/(|x|+1)`,
-        // encoder.slang) so `BsdfDecoder` trains on (-1, 1). That is fine for
-        // stock RTNAM, which always pairs it with `bsdf_finetuning: 0` -- and
-        // train.py says why it has to:
-        //
-        //   assert not config[model][latents][normalize], (
-        //       "Direct optimization of latents is not compatible with "
-        //       "latent normalization."
-        //   )
-        //
-        // This path DOES run direct optimization, so normalization is off and
-        // everything -- encoder output, warm-start target, this grid's output,
-        // the latents `BsdfDecoder` sees -- lives in one unsquashed space with
-        // unit gradient throughout.
-        //
-        // Four output variants were measured at full scale before settling
-        // here; the reasons are easy to re-introduce:
-        //
-        //   - Squash applied during warm-start as well, against the encoder's
-        //     *post*-squash output: a double squash. To express a target of
-        //     0.9 the MLP had to output 9, deep in the squash's
-        //     vanishing-gradient region (derivative `1/(1+|x|)^2`), so 59% of
-        //     components pinned near +-1 and never recovered. PSNR -179 dB.
-        //   - Leaky clamp (bound 4 then 1, leak 0.01): self-defeating. Beyond
-        //     the bound the gradient is only 0.01, nearly as dead as the
-        //     squash, while 1% of a large raw value is still large, so it did
-        //     not bound either. PSNR -287/-434 dB.
-        //   - Squash on the output with warm-start regressing in *pre*-squash
-        //     space (so warm-start itself had unit gradient -- the obvious fix
-        //     to the first variant). This bounded the latents correctly:
-        //     measured [-0.92, 0.94] against dense's [-0.79, 0.89]. It still
-        //     rendered at -37.5 dB. The reason is that the encoder's own raw
-        //     latents are large (warm-start learned mean |z| = 5.37, range
-        //     [-11.8, 14.5]), so the squash ran deep in saturation and scaled
-        //     direct optimization's gradients by ~0.025, effectively freezing
-        //     the grid. **The latent range was never the problem** -- this
-        //     variant proves it, by fixing the range and changing nothing.
-        //   - No squash, `normalize: true` left on (so the warm-start target
-        //     was squashed but this output was not): internally inconsistent,
-        //     yet it reached +32.24 dB at 1.11 bpp because direct optimization
-        //     co-adapts `BsdfDecoder`. It failed at 20 bpp (-313.8 dB), where
-        //     the larger grid drifts further out of the band the decoder knows
-        //     ([-3.91, 3.56] versus [-1.65, 1.76]).
-        //
-        // Hence: no squash anywhere, and `normalize: false`.
+        // Keep decoded latents unbounded and disable latent normalization for
+        // this path. Encoder targets, warm-start, and direct optimization must
+        // share one unsquashed latent space with unit output gradients.
         return decoder.forward(decoder_input);
     }
 
@@ -226,48 +164,12 @@ struct NtcLatentTexture<
     }
 }
 
-// Deterministic Fourier-style positional encoding, mirroring RTXNTC's own
-// ``EncodeSamplePosition`` (RegressionKernels.h): per octave, two offset
-// phases (0 and 0.25) of ``frac(coord) * 2 - 1``, doubling frequency each
-// octave.
+// RTXNTC-style positional encoding: two offset phases per octave, with
+// frequency doubling each octave. Frequencies use the high-res feature-grid
+// resolution, never the color texture resolution.
 //
-// ``grid_resolution`` is the HIGH-RES FEATURE GRID resolution, not the color
-// texture resolution, and the 0.5 factor below is RTXNTC's: together they
-// reproduce its ``posf = uv * gridWidth * 0.5`` exactly (derivation at the
-// call site). The first octave therefore spans two grid cells and the last
-// of three octaves reaches 2x the grid resolution.
-//
-// THIS SCALE IS LOAD-BEARING; DO NOT TIE IT TO THE COLOR TEXTURE RESOLUTION.
-// An earlier version used ``uv * color_texture_resolution`` (4096), which at
-// gridSizeScale 2 is 4x too high in every octave and at gridSizeScale 6 is
-// 12x too high -- the top octave reaching 8-24x the grid resolution. Inside a
-// single grid cell the feature inputs are only a bilinear (linear) ramp, so
-// the decode MLP could not represent sub-cell structure from them; instead it
-// fit the training residual off the aliased sawtooth, which at those
-// frequencies acts as a pseudo-random hash of the UV. Measured consequence on
-// the 20 bpp run: within ONE grid cell the decoded latents swung over
-// [-3.07, 1.28] with 543x more total variation than net change, and held-out
-// UVs hashed differently from training UVs, so latents reached [-15.2, 6.0]
-// against the encoder's real [-0.79, 0.89]. Warm-start *training* MSE looked
-// healthy (0.0073) while the render was -240 dB -- a pure train/test gap. See
-// rtcnam/NTC_LATENT_TEXTURE_NOTES.md.
-//
-// Explicit band-limiting (rtcnam/MIP_SAMPLING_PLAN.md Stage 4, "explicit"
-// option, stacked on top of the "implicit" one -- the two were never
-// mutually exclusive): smoothly zero out the highest octaves as `mip_level`
-// increases, in addition to (not instead of) `grid_resolution` already
-// shrinking per mip. Standard procedural-noise mip-fade technique --
-// `keep_octaves` drops by exactly one per mip level, and each octave's own
-// weight is a 1-wide linear ramp from 1 (fully present) to 0 (fully faded)
-// centered on that cutoff.
-//
-// `mip_level == 0` is an exact, provable no-op, not a tuned-to-look-right
-// approximation: `keep_octaves == NumWaves` there, so for every valid
-// octave index `w` (0..NumWaves-1), `keep_octaves - w >= 1`, so
-// `clamp(keep_octaves - w, 0, 1) == 1` for all of them. This is true for
-// every value `NumWaves` is ever configured to, so every single-mip config
-// (every config in the repo before this plan, and mip 0 of every config
-// after it) renders byte-identical to before this change.
+// Higher octaves fade as mip_level increases. At mip 0 every octave has unit
+// weight, so filtering is disabled.
 float[4 * NumWaves] encode_position<int NumWaves>(float2 uv, int grid_resolution, bool wrap, int mip_level)
 {
     float2 local_uv = wrap ? (uv - floor(uv)) : max(0.f, uv);
