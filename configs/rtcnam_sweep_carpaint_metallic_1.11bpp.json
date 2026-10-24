@@ -79,8 +79,8 @@
         },
         "decoder": {
             "hidden_layers": [
-                128,
-                64
+                16,
+                16
             ],
             "hidden_activations": "SmeLU",
             "output_activation": {
