@@ -16,17 +16,20 @@
 // the configuration that PRODUCED the broken 5/10/20bpp sweep results
 // (robust PSNR -17dB, frac>100 up to 0.568). Three differences, all from the
 // fix7/fix8 lineage:
-//   - model.decoder.hidden_layers [16,16] -> [128,64]. The actual fix: the
-//     BSDF decoder was capacity-mismatched against the sharper latent field
-//     the grid resolves at the finer presets.
+//   - model.decoder.hidden_layers [16,16] -> [128,64]. The BSDF decoder was
+//     capacity-mismatched against the sharper latent field the grid resolves
+//     at the finer presets.
 //   - model.decoder.output_clamp -> 100.0. Bounds a single BSDF evaluation.
 //   - model.sampler.weight_cap -> 1.0. Bounds the indirect-bounce importance
 //     weight (bsdf / sampler pdf), which output_clamp alone does not --
 //     a clamped bsdf over a near-zero pdf still explodes.
 //
-// Also note the 1.11bpp preset was ALREADY healthy at [16,16] (+42dB); the
-// capacity fix is what the other three presets needed. Keeping one recipe
-// across all four keeps the rate-distortion curve a single-variable sweep.
+// 2026-10-23: hidden_layers reverted to the stock [16,16]. [128,64] made
+// every training iteration ~20x slower (44ms vs ~3ms train kernel), and the
+// 1.11bpp preset was already healthy at [16,16] (+42dB). The finer presets
+// failed at [16,16] in the earlier sweep, so check them for the -17dB /
+// firefly signature before trusting their results. Keeping one recipe across
+// all presets keeps the rate-distortion curve a single-variable sweep.
 {
     "reference_materials": [
         {
@@ -138,8 +141,8 @@
         },
         "decoder": {
             "hidden_layers": [
-                128,
-                64
+                16,
+                16
             ],
             "hidden_activations": "SmeLU",
             "output_activation": {

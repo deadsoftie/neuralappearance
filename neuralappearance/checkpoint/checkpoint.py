@@ -142,6 +142,22 @@ def encode_latent_texture_if_needed(
     print(f'Encoding took {(timer.elapsed()):.2f}s.')
 
 
+def merge_checkpoint_params(model_config: dict, desc: list[str], params: dict) -> None:
+    """Write one ``save_checkpoint_params`` record into ``model_config`` at ``desc``.
+
+    Records are merged, not assigned: a component's own record shares its path
+    with the records its children already wrote there, and assigning would
+    drop the children (e.g. a latent texture's decode MLP weights).
+    """
+    c = model_config
+    for key in desc[:-1]:
+        c = c.setdefault(key, {})
+    if isinstance(c.get(desc[-1]), dict) and isinstance(params, dict):
+        c[desc[-1]].update(params)
+    else:
+        c[desc[-1]] = params
+
+
 def save_model(ckpt: Checkpoint) -> None:
     """Write model tensors and architecture metadata enabled by the config."""
 
@@ -170,12 +186,7 @@ def save_model(ckpt: Checkpoint) -> None:
                 continue
 
             for desc, params in component.save_checkpoint_params([name, '_params']):
-                c = model_config
-                for key in desc[:-1]:
-                    if key not in c:
-                        c[key] = {}
-                    c = c[key]
-                c[desc[-1]] = params
+                merge_checkpoint_params(model_config, desc, params)
 
             model_config[name]['_type_name'] = component.type_name
 
