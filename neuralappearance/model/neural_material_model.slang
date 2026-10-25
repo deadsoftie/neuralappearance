@@ -11,6 +11,7 @@ __exported import encoder;
 __exported import half_diff_parameterization;
 __exported import latent_texture;
 __exported import ntc_latent_texture;
+__exported import ntc_sdk_latent_texture;
 __exported import rotation;
 __exported import sampler;
 

@@ -20,6 +20,7 @@ from .encoder import Encoder
 from .latent_texture import LatentTexture
 from .bc_latent_texture import BcLatentTexture
 from .ntc_latent_texture import NtcLatentTexture
+from .ntc_sdk_latent_texture import NtcSdkLatentTexture
 from .sampler import Sampler
 
 # Both store per-material spatial state directly (grid/texel buffers) rather
@@ -148,6 +149,9 @@ class NeuralModel:
         # `"ntc_grid"` (rtcnam/PLAN.md) swaps in a pair of lower-resolution
         # feature grids decoded by a small MLP, matching NVIDIA's shipped
         # RTXNTC SDK's grid-shape/quantization recipe.
+        # `"ntc_sdk"` renders a texture set compressed by ntc-cli (the post-hoc
+        # baseline) from its grids, decoding the way RTXNTC does; it shares
+        # the `ntc_grid` config section and is inference-only.
         # `"bc_grid"` (rtbcnam/PLAN.md) swaps in BC6H-shaped feature textures
         # whose sampled values ARE the latent -- no decode MLP at all, so
         # nothing diverges per lane and hardware filtering comes for free.
@@ -163,7 +167,7 @@ class NeuralModel:
                 latents_config['num_channels'],
                 optimizable=False,
             )
-        elif latents_type == 'ntc_grid':
+        elif latents_type in ('ntc_grid', 'ntc_sdk'):
             # `num_mip_levels > 1` stacks RTNAM's own outer multi-mip
             # Russian-roulette filtering on top of the grid pair's own
             # inner high/low-res pyramid -- a deliberate divergence from
@@ -194,7 +198,8 @@ class NeuralModel:
                 if decoder_quant_config.get('enabled', False)
                 else None
             )
-            latent_texture = NtcLatentTexture.from_reference_materials(
+            ntc_class = NtcSdkLatentTexture if latents_type == 'ntc_sdk' else NtcLatentTexture
+            latent_texture = ntc_class.from_reference_materials(
                 reference_materials,
                 latents_config['num_channels'],
                 ntc_config['grid_size_scale'],

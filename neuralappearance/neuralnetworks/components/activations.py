@@ -88,6 +88,11 @@ class HardGELU(Activation):
         super().__init__('HardGELU', width, dtype)
 
 
+class HardGELUClamp(Activation):
+    def __init__(self, width: AutoSettable[int] = Auto, dtype: AutoSettable[Real] = Auto):
+        super().__init__('HardGELUClamp', width, dtype)
+
+
 class SmeLU(Activation):
     def __init__(self, width: AutoSettable[int] = Auto, dtype: AutoSettable[Real] = Auto):
         super().__init__('SmeLU', width, dtype)

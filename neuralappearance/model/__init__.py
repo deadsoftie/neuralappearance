@@ -23,6 +23,7 @@ from .neural_material_model import (
     TrainingStatus,
 )
 from .ntc_latent_texture import NtcLatentTexture
+from .ntc_sdk_latent_texture import NtcSdkLatentTexture
 from .rotation import Rotation
 from .sampler import Sampler
 from .texture import Texture
@@ -44,6 +45,7 @@ __all__ = [
     'NeuralModel',
     'NeuralModelCheckpoint',
     'NtcLatentTexture',
+    'NtcSdkLatentTexture',
     'Rotation',
     'Sampler',
     'SamplerInput',
