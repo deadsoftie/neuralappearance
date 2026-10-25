@@ -30,6 +30,10 @@ class NeuralMaterial(f2.Material):
         self.config_tensor: spy.Tensor | None = None
         self.module_hash = ''
         self.reference_material_id = 0
+        # rtcnam: None picks the latent cache by latent type (see
+        # code_generate); True/False forces it, so rtcnam/render_timing.py can
+        # measure both settings on one checkpoint.
+        self.cache_latents_override: bool | None = None
 
     def configure(
         self,
@@ -120,6 +124,8 @@ class NeuralMaterial(f2.Material):
         from model import NtcLatentTexture
 
         cache_latents = isinstance(latents, NtcLatentTexture)
+        if self.cache_latents_override is not None:
+            cache_latents = self.cache_latents_override
 
         return _NEURAL_MATERIAL_CONFIG_TEMPLATE.format(
             latents_type=latents.type_name,
