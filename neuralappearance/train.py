@@ -33,6 +33,7 @@ from datagen import (
     create_aux_data_generator,
 )
 from model import BcLatentTexture, NeuralModel, NtcLatentTexture
+from model.ntc_latent_texture import quant_noise_from_config
 from rendering import Renderer
 from rendering.pathtracer_helpers import create_testscene
 from slangpy.core.native import Shape
@@ -42,6 +43,7 @@ from training import (
     LossBuffer,
     LossFunction,
     LRSchedulerChain,
+    LRSchedulerSlice,
     TrainingPhase,
     TrainingTargets,
 )
@@ -253,6 +255,8 @@ class TrainingPhaseRuntime:
         self.training_phase: TrainingPhase = phase_state.phase
 
         self.iteration = 0
+        # Training samples per instance, summed over optimizer iterations.
+        self.num_samples = 0
         self.latest_instance_losses = np.zeros(self.neural_model.num_instances)
         self.lr_scheduler = lr_scheduler
         self.batch_instance_scheduler = batch_instance_scheduler
@@ -382,6 +386,7 @@ class TrainingPhaseRuntime:
         """Run the optimizer step and update learning rate."""
         self.optimizer.step(command_buffer)
         command_buffer.global_barrier()
+        self.num_samples += self.batch_size
         # Update the learning rate.
         self.iteration = min(self.iteration + 1, self.num_iterations)
         scale = self.lr_scheduler.get_scale(self.iteration)
@@ -769,6 +774,7 @@ class TrainingJob:
                 'phase': phase_state.phase,
                 'label': phase_state.display_label,
                 'num_iterations': phase_runtime.num_iterations,
+                'num_samples': phase_runtime.num_samples,
                 'total_time': total_time,
                 'optimization_time': optimization_time,
                 'iterations_per_second': iterations_per_second,
@@ -1264,17 +1270,88 @@ def training_bsdf_diropt(job: TrainingJob) -> None:
     if isinstance(latent_texture, (NtcLatentTexture, BcLatentTexture)):
         latent_texture.ready_for_render = True
 
-    job.run_phase_optimization(
-        phase_state=phase_state,
-        lr_scheduler=lr_scheduler,
-        batch_instance_scheduler=batch_instance_scheduler,
-        data_generator=job.data_generators.bsdf,
-        run_train_kernel=run_train_kernel,
-    )
+    qat = None
+    if isinstance(latent_texture, NtcLatentTexture) and config['model']['latents']['type'] == 'ntc_grid':
+        qat = quant_noise_from_config(config['model']['latents']['ntc_grid'])
+
+    if qat is None:
+        job.run_phase_optimization(
+            phase_state=phase_state,
+            lr_scheduler=lr_scheduler,
+            batch_instance_scheduler=batch_instance_scheduler,
+            data_generator=job.data_generators.bsdf,
+            run_train_kernel=run_train_kernel,
+        )
+    else:
+        _run_quantization_aware_diropt(
+            job, qat, latent_texture, lr_scheduler, batch_instance_scheduler, run_train_kernel
+        )
 
     # Mark neural model components as trained.
     neural_model.decoder.status = 'Done'
     neural_model.latent_texture.status = 'Done'
+
+
+def _run_quantization_aware_diropt(
+    job: TrainingJob,
+    qat: dict,
+    latent_texture: NtcLatentTexture,
+    lr_scheduler: LRScheduler,
+    batch_instance_scheduler: BatchInstanceScheduler,
+    run_train_kernel: Callable[[TrainingPhaseRuntime, spy.Tensor, InFlightIterationBlock], None],
+) -> None:
+    """Direct optimization under simulated quantization noise (review T11).
+
+    The first `freeze_fraction` of the phase trains with one quantization step
+    of uniform noise on every grid lookup, its width following each grid's
+    range every `refresh_period` iterations. The grids are then rounded and
+    frozen, and the rest of the phase trains the decode MLP and BSDF decoder
+    on the rounded grids, continuing the same learning-rate schedule. This is
+    the SDK's order: noise, then round and freeze at 95%. The two parts are
+    separate phases, so the tail starts a fresh optimizer; only the noisy
+    part's end has no checkpoint, since its renders would carry the noise.
+    """
+    num_iterations = lr_scheduler.num_iterations
+    num_noisy = round(num_iterations * qat['freeze_fraction'])
+    bits = qat['bits']
+
+    ranges = latent_texture.set_quant_noise(bits)
+    print(f'Quantization-aware direct optimization: {bits}-bit noise for {num_noisy} of '
+          f'{num_iterations} iterations, refreshed every {qat["refresh_period"]}.')
+    print(f'  grid ranges at start: {[(round(lo, 3), round(hi, 3)) for lo, hi in ranges]}')
+
+    def run_noisy_kernel(phase_runtime, sample, iteration_block):
+        if phase_runtime.iteration > 0 and phase_runtime.iteration % qat['refresh_period'] == 0:
+            latent_texture.set_quant_noise(bits)
+        run_train_kernel(phase_runtime, sample, iteration_block)
+
+    checkpoint_phases = job.config['checkpoints']['phases']
+    job.config['checkpoints']['phases'] = [p for p in checkpoint_phases if p != 'BsdfDirectOptimization']
+    try:
+        job.run_phase_optimization(
+            phase_state=job.begin_phase('BsdfDirectOptimization', 'quant_noise'),
+            lr_scheduler=LRSchedulerSlice(lr_scheduler, 0, num_noisy),
+            batch_instance_scheduler=batch_instance_scheduler,
+            data_generator=job.data_generators.bsdf,
+            run_train_kernel=run_noisy_kernel,
+        )
+    finally:
+        job.config['checkpoints']['phases'] = checkpoint_phases
+        latent_texture.clear_quant_noise()
+
+    print(f'Quantizing NTC grids to {bits}-bit ({(1 << bits) - 1} levels) at iteration {num_noisy}...')
+    for s in latent_texture.quantize_grids(bits):
+        print(f"  tile {s['tile_idx']:3d} mip {s['mip_level']} {s['kind']:8s} "
+              f"range=[{s['min']:7.3f},{s['max']:6.3f}] step={s['step']:.5f} rms_error={s['rms_error']:.5f}")
+    latent_texture.freeze_grids()
+
+    job.run_phase_optimization(
+        phase_state=job.begin_phase('BsdfDirectOptimization', 'quant_frozen'),
+        lr_scheduler=LRSchedulerSlice(lr_scheduler, num_noisy, num_iterations - num_noisy),
+        batch_instance_scheduler=batch_instance_scheduler,
+        data_generator=job.data_generators.bsdf,
+        run_train_kernel=run_train_kernel,
+    )
 
 
 def training_ntc_quantize(job: TrainingJob) -> None:
@@ -1311,9 +1388,14 @@ def training_ntc_quantize(job: TrainingJob) -> None:
         'latent texture Done, so active_training_models() already excludes it.'
     )
 
+    latent_texture = neural_model.latent_texture.instances[0]
+    if latent_texture.quantized:
+        # Quantization-aware direct optimization already rounded and froze them.
+        print('NTC grids already quantized during direct optimization; skipping.')
+        return
+
     bits = quantize_config.get('bits', 4)
     print(f'Quantizing NTC grids to {bits}-bit ({(1 << bits) - 1} levels)...')
-    latent_texture = neural_model.latent_texture.instances[0]
     stats = latent_texture.quantize_grids(bits)
 
     # Freeze the grids themselves, but deliberately NOT the decode MLP:

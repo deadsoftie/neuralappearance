@@ -85,6 +85,64 @@ struct Texture<int NumChannels>
         return result;
     }
 
+    // rtcnam: `get_bilinear` with simulated quantization noise, for
+    // quantization-aware direct optimization of NTC grids
+    // (`model.latents.ntc_grid.quant_noise`). Each corner value gets uniform
+    // noise in [-noise_width / 2, noise_width / 2) before the blend, as the
+    // RTXNTC SDK trains its grids under one quantization step of uniform
+    // noise. The noise is an additive constant, so gradients reach the
+    // corners exactly as in `get_bilinear` (straight-through). It is drawn
+    // per lookup, hashed from the corner texel, the channel and the lookup's
+    // own uv, rather than once per texel per optimizer step.
+    [BackwardDifferentiable]
+    float[NumChannels] get_bilinear_noisy(float2 uv, no_diff float noise_width, no_diff uint salt)
+    {
+        uint2 texels[4];
+        float weights[4];
+        get_bilinear_interpolation_texels_and_weights(
+            uv,
+            uint2(this.resolution),
+            this.wrap,
+            texels,
+            weights
+        );
+        let lookup_seed = _quant_noise_seed(asuint(detach(uv.x)), asuint(detach(uv.y)), salt);
+
+        float[NumChannels] result = {};
+        [ForceUnroll]
+        for (int i = 0; i < 4; ++i)
+        {
+            float[NumChannels] code = _get_code(texels[i]);
+            [ForceUnroll]
+            for (int l = 0; l < NumChannels; ++l)
+                result[l] += weights[i] * (code[l] + _quant_noise(texels[i], l, lookup_seed, noise_width));
+        }
+        if (!optimizable)
+            result = detach(result);
+        return result;
+    }
+
+    // PCG hash (Jarzynski and Olano 2020) of the lookup's uv bits and a salt.
+    uint _quant_noise_seed(uint u, uint v, uint salt)
+    {
+        return _pcg(u ^ _pcg(v ^ _pcg(salt)));
+    }
+
+    float _quant_noise(uint2 texel, int channel, uint lookup_seed, float noise_width)
+    {
+        let h = _pcg(lookup_seed ^ _pcg(texel.x ^ _pcg(texel.y ^ _pcg(uint(channel)))));
+        // Top 24 bits -> [0, 1), exact in float32.
+        let u = float(h >> 8) * (1.f / 16777216.f);
+        return (u - 0.5f) * noise_width;
+    }
+
+    uint _pcg(uint v)
+    {
+        let state = v * 747796405u + 2891336453u;
+        let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+        return (word >> 22u) ^ word;
+    }
+
     [BackwardDifferentiable]
     float[NumChannels] get_bilinear_stochastic(float2 uv, float sample)
     {

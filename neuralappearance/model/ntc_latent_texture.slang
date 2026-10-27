@@ -26,6 +26,11 @@ struct NtcLatentTexture<
     StructuredBuffer<int>.Handle material_texture_resolution;
     Texture<NumFeatures> high_res_grids[NumTiles * NumMipLevels];
     Texture<NumFeatures> low_res_grids[NumTiles * NumMipLevels];
+    // rtcnam: simulated quantization noise width per grid, high-res grids
+    // first, then low-res, in `get_grid_idx` order. Zero (the default, and
+    // always at render time) fetches without noise; quantization-aware
+    // direct optimization sets one 4-bit step of each grid's range.
+    StructuredBuffer<float>.Handle quant_noise_widths;
     Decoder decoder;
 
     int get_texture_resolution(int material_id)
@@ -40,8 +45,21 @@ struct NtcLatentTexture<
         let tile_idx = get_tile_idx(input.material_id, udim_idx);
         let grid_idx = get_grid_idx(tile_idx, input.mip_level);
 
-        float[NumFeatures] hi = high_res_grids[grid_idx].get_bilinear(input.uv);
-        float[NumFeatures] lo = low_res_grids[grid_idx].get_bilinear(input.uv);
+        // Plain helper for the same reason as the ones below.
+        let noise_hi = get_quant_noise_width(grid_idx);
+        let noise_lo = get_quant_noise_width(NumTiles * NumMipLevels + grid_idx);
+        float[NumFeatures] hi;
+        float[NumFeatures] lo;
+        if (noise_hi > 0.f || noise_lo > 0.f)
+        {
+            hi = high_res_grids[grid_idx].get_bilinear_noisy(input.uv, noise_hi, 0u);
+            lo = low_res_grids[grid_idx].get_bilinear_noisy(input.uv, noise_lo, 1u);
+        }
+        else
+        {
+            hi = high_res_grids[grid_idx].get_bilinear(input.uv);
+            lo = low_res_grids[grid_idx].get_bilinear(input.uv);
+        }
 
         // Plain (non-[Differentiable]) helper calls, not an inline `no_diff`
         // subscript: an inline `no_diff material_texture_resolution[...]`
@@ -117,6 +135,11 @@ struct NtcLatentTexture<
     int get_grid_resolution(int grid_idx)
     {
         return high_res_grids[grid_idx].resolution;
+    }
+
+    float get_quant_noise_width(int noise_idx)
+    {
+        return quant_noise_widths[noise_idx];
     }
 
     // RTXNTC's ``positionLod`` (TextureSet.cpp:462):

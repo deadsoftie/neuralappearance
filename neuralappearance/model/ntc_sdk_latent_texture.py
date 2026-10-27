@@ -50,6 +50,8 @@ class NtcSdkLatentTexture(NtcLatentTexture):
 
     def model_data(self):
         data = super().model_data()
+        # Training-only field of the joint route's grid; the SDK decode has none.
+        del data['quant_noise_widths']
         data['output_affine'] = self.output_affine_gpu.storage.descriptor_handle_ro
         return data
 

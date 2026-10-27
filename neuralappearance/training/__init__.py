@@ -10,6 +10,7 @@ from .lr_schedulers import (
     CosineAnnealingLRScheduler,
     LRScheduler,
     LRSchedulerChain,
+    LRSchedulerSlice,
 )
 from .target import TrainingTarget, TrainingTargets
 
@@ -20,6 +21,7 @@ __all__ = [
     'CosineAnnealingLRScheduler',
     'LRScheduler',
     'LRSchedulerChain',
+    'LRSchedulerSlice',
     'LossBuffer',
     'LossFunction',
     'TrainingPhase',

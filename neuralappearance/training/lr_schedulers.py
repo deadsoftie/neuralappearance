@@ -55,3 +55,19 @@ class LRSchedulerChain(LRScheduler):
 
         # Past the chain, retain the final scheduler's last value.
         return self.schedulers[-1].get_scale(self.schedulers[-1].num_iterations)
+
+
+class LRSchedulerSlice(LRScheduler):
+    """Iterations ``[start, start + num_iterations)`` of another schedule.
+
+    Lets one schedule run across consecutive phases, as when quantization-aware
+    direct optimization stops to round and freeze the grids part way through.
+    """
+
+    def __init__(self, base: LRScheduler, start: int, num_iterations: int):
+        super().__init__(num_iterations)
+        self.base = base
+        self.start = start
+
+    def get_scale(self, iteration: int) -> float:
+        return self.base.get_scale(self.start + min(iteration, self.num_iterations))

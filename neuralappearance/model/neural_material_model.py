@@ -19,7 +19,7 @@ from .bsdf_decoder import BsdfDecoder
 from .encoder import Encoder
 from .latent_texture import LatentTexture
 from .bc_latent_texture import BcLatentTexture
-from .ntc_latent_texture import NtcLatentTexture
+from .ntc_latent_texture import NtcLatentTexture, decoder_activation_from_config, quant_noise_from_config
 from .ntc_sdk_latent_texture import NtcSdkLatentTexture
 from .sampler import Sampler
 
@@ -191,6 +191,8 @@ class NeuralModel:
                         'model.latents.ntc_grid.quantize.bits must be 1-4 (the packed '
                         f'checkpoint format stores one nibble per value), got {bits}.'
                     )
+            # Same fail-early reasoning for the joint-route variants (T11).
+            quant_noise_from_config(ntc_config)
 
             decoder_quant_config = ntc_config.get('decoder_quantization', {})
             decoder_quantization = (
@@ -206,7 +208,7 @@ class NeuralModel:
                 ntc_config['num_features'],
                 ntc_config.get('num_pos_enc_waves', 3),
                 ntc_config['decoder_hidden_layers'],
-                ntc_config.get('decoder_activation', 'HardGELU'),
+                decoder_activation_from_config(ntc_config),
                 num_mip_levels=latents_config['num_mip_levels'],
                 optimizable=False,
                 decoder_quantization=decoder_quantization,

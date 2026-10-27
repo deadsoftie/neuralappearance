@@ -85,6 +85,52 @@ def _unpack_quantized_grid(buf: bytes) -> tuple[int, int, int, float, float, np.
     return bits, resolution, num_channels, float(lo), float(hi), values
 
 
+def decoder_activation_from_config(ntc_config: dict) -> str:
+    """Decode-network activation for a `model.latents.ntc_grid` block.
+
+    `activation_clamp: 3` selects the SDK's HardGELUClamp, whose output is
+    bounded to [-3/16, 3]; unset keeps `decoder_activation` (HardGELU, which
+    continues as the identity). HardGELUClamp's bound is fixed in its Slang
+    source, so 3 is the only value accepted.
+    """
+    clamp = ntc_config.get('activation_clamp')
+    if clamp is None:
+        return ntc_config.get('decoder_activation', 'HardGELU')
+    if clamp != 3:
+        raise ValueError(
+            f'model.latents.ntc_grid.activation_clamp must be 3 (HardGELUClamp\'s fixed bound) '
+            f'or unset, got {clamp!r}.'
+        )
+    return 'HardGELUClamp'
+
+
+def quant_noise_from_config(ntc_config: dict) -> dict | None:
+    """Settings for quantization-aware direct optimization, or None when off.
+
+    `model.latents.ntc_grid.quant_noise: {"enabled": true}` trains the grids
+    under one quantization step of simulated uniform noise for the first
+    `freeze_fraction` of direct optimization, then rounds and freezes them
+    there, as the RTXNTC SDK does at 95% of its steps. `refresh_period`
+    iterations between updates of the noise width to the grids' current
+    range. Requires `quantize.enabled`, whose `bits` sets the step.
+    """
+    qat = ntc_config.get('quant_noise') or {}
+    if not qat.get('enabled', False):
+        return None
+    if not ntc_config.get('quantize', {}).get('enabled', False):
+        raise ValueError('model.latents.ntc_grid.quant_noise needs quantize.enabled: it sets the bit depth.')
+    settings = {
+        'bits': ntc_config['quantize'].get('bits', 4),
+        'freeze_fraction': qat.get('freeze_fraction', 0.95),
+        'refresh_period': qat.get('refresh_period', 5000),
+    }
+    if not (0.0 < settings['freeze_fraction'] < 1.0):
+        raise ValueError(f'quant_noise.freeze_fraction must be in (0, 1), got {settings["freeze_fraction"]}.')
+    if settings['refresh_period'] < 1:
+        raise ValueError(f'quant_noise.refresh_period must be >= 1, got {settings["refresh_period"]}.')
+    return settings
+
+
 class NtcLatentTexture(IModel):
     """NTC-style high/low-resolution feature grids decoded by a small MLP.
 
@@ -188,6 +234,12 @@ class NtcLatentTexture(IModel):
         # trainable. See that method for why the quantize tail needs this.
         self.grids_frozen = False
 
+        # Simulated quantization noise width per grid (high-res grids, then
+        # low-res), read by the Slang side on every lookup. All zero except
+        # while `set_quant_noise()` is in effect during quantization-aware
+        # direct optimization; checkpoints never store it.
+        self.quant_noise_widths: list[float] = []
+
     @property
     def decoder_input_width(self) -> int:
         """Width of the decode MLP's input vector: both grids' features, the
@@ -247,6 +299,10 @@ class NtcLatentTexture(IModel):
         self.material_texture_resolution_gpu = spy.Tensor.from_numpy(
             module.device, np.array(self.material_texture_resolution, dtype=np.int32)
         )
+        self.quant_noise_widths = [0.0] * (len(self.high_res_grids) + len(self.low_res_grids))
+        self.quant_noise_widths_gpu = spy.Tensor.from_numpy(
+            module.device, np.array(self.quant_noise_widths, dtype=np.float32)
+        )
 
         self.decoder = MLP(
             dtype=Real.half,
@@ -287,6 +343,30 @@ class NtcLatentTexture(IModel):
         self.grids_frozen = True
         for grid in self.high_res_grids + self.low_res_grids:
             grid.optimizable = False
+
+    def set_quant_noise(self, bits: int) -> list[tuple[float, float]]:
+        """Turn on simulated quantization noise of one ``bits``-bit step.
+
+        Each grid's step is its current range over ``2**bits - 1``, the step
+        `quantize_grids()` would round to now. The grids are unbounded, so a
+        caller that trains for long should call this again to follow the
+        range. The widths live in a buffer that the model data points to, so
+        an update needs no `write_to_buffer()`. Returns each grid's range,
+        high-res grids first.
+        """
+        levels = (1 << bits) - 1
+        ranges = []
+        for grid in self.high_res_grids + self.low_res_grids:
+            data = grid.to_numpy().astype(np.float32)
+            ranges.append((float(data.min()), float(data.max())))
+        self.quant_noise_widths = [(hi - lo) / levels for lo, hi in ranges]
+        self.quant_noise_widths_gpu.copy_from_numpy(np.array(self.quant_noise_widths, dtype=np.float32))
+        return ranges
+
+    def clear_quant_noise(self) -> None:
+        """Turn simulated quantization noise off again."""
+        self.quant_noise_widths = [0.0] * len(self.quant_noise_widths)
+        self.quant_noise_widths_gpu.copy_from_numpy(np.array(self.quant_noise_widths, dtype=np.float32))
 
     def quantize_grids(self, bits: int) -> list[dict]:
         """Round every grid to ``2**bits`` levels spanning its own range.
@@ -374,6 +454,7 @@ class NtcLatentTexture(IModel):
             'material_texture_resolution': self.material_texture_resolution_gpu.storage.descriptor_handle_ro,
             'high_res_grids': [grid.get_this() for grid in self.high_res_grids],
             'low_res_grids': [grid.get_this() for grid in self.low_res_grids],
+            'quant_noise_widths': self.quant_noise_widths_gpu.storage.descriptor_handle_ro,
             'decoder': self.decoder.get_this(),
         }
 
